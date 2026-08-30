@@ -453,12 +453,6 @@
   .assess-row-preview.total { border-top: 1px solid var(--border); margin-top: 4px; padding-top: 6px; font-weight: 600; }
   .assess-adjusted { color: var(--accent); font-weight: 700; }
 
-  .unsaved-banner {
-    display: flex; align-items: center; justify-content: center; gap: 10px;
-    background: var(--gold-soft); color: var(--gold); border-bottom: 1px solid var(--border);
-    font-size: 0.78rem; font-weight: 600; padding: 7px 16px; text-align: center;
-  }
-  .unsaved-banner .link-btn { color: var(--gold); font-weight: 700; }
   input[type="file"] { display: none; }
   hr.div { border: none; border-top: 1px solid var(--border); margin: 18px 0; }
 </style>
@@ -479,10 +473,6 @@
     </div>
   </div>
 </header>
-<div class="unsaved-banner" id="unsavedBanner" style="display:none">
-  <span>Unsaved changes — this device only.</span>
-  <button class="link-btn" id="unsavedBannerExport">Export backup</button>
-</div>
 
 <div class="stats-row" id="statsRow"></div>
 
@@ -818,12 +808,6 @@
     renderIncomeChart();
     renderComposition();
     renderLedger(derived);
-    updateUnsavedBanner();
-  }
-
-  function updateUnsavedBanner() {
-    var banner = document.getElementById("unsavedBanner");
-    if (banner) banner.style.display = hasUnexportedChanges() ? "flex" : "none";
   }
 
   function renderAccountCards(derived) {
@@ -3345,6 +3329,16 @@
   }
 
   function handleExport() {
+    if (!hasUnexportedChanges()) {
+      openConfirm("Nothing has changed since your last backup. Export anyway?", "Export anyway", false).then(function (ok) {
+        if (ok) doExport();
+      });
+      return;
+    }
+    doExport();
+  }
+
+  function doExport() {
     var json = JSON.stringify(state, null, 2);
     var filename = slug(state.business) + "-backup-" + todayStr() + ".json";
     if (!window.claude || typeof window.claude.use !== "function") {
@@ -3408,7 +3402,6 @@
   var syncBtnEl = document.getElementById("syncBtn");
   if (!syncEnabled()) { syncBtnEl.style.display = "none"; }
   syncBtnEl.addEventListener("click", function () { syncFromServer(false); });
-  document.getElementById("unsavedBannerExport").addEventListener("click", handleExport);
   document.getElementById("txOverlay").addEventListener("click", function (e) { if (e.target.id === "txOverlay") closeTxSheet(); });
   document.getElementById("settingsOverlay").addEventListener("click", function (e) { if (e.target.id === "settingsOverlay") closeSettingsSheet(); });
   document.getElementById("assessOverlay").addEventListener("click", function (e) { if (e.target.id === "assessOverlay") closeAssessSheet(); });
