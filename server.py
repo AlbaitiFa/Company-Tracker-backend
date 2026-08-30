@@ -202,6 +202,64 @@ def log_expense(state, args):
     return f'Expense logged: {amount:.2f} {currency} from {bucket_label(state, bucket_id)} - "{description}" on {tx_date}.'
 
 
+def list_transactions(state, args):
+    limit = args.get("limit")
+    try:
+        limit = int(limit) if limit is not None else 20
+    except (TypeError, ValueError):
+        limit = 20
+    limit = max(1, min(limit, 200))
+
+    type_filter = args.get("type")
+    bucket_id_filter = None
+    if args.get("bucket"):
+        bucket_id_filter = resolve_bucket_id(state, args["bucket"])
+        if not bucket_id_filter:
+            names = ", ".join(b["name"] for b in state["buckets"])
+            raise ToolError(f'Unknown bucket "{args["bucket"]}". Available buckets: {names}')
+    since = args.get("since")
+
+    def matches(t):
+        if type_filter and t.get("type") != type_filter:
+            return False
+        if bucket_id_filter:
+            if t.get("type") == "income":
+                if not (t.get("split") and bucket_id_filter in t["split"]):
+                    return False
+            elif t.get("bucketId") != bucket_id_filter:
+                return False
+        if since and t.get("date", "") < since:
+            return False
+        return True
+
+    txs = [t for t in state["transactions"] if matches(t)]
+    txs.sort(key=lambda t: (t.get("date", ""), t.get("createdAt", 0)), reverse=True)
+    total_matches = len(txs)
+    shown = txs[:limit]
+
+    if not shown:
+        return "No transactions match."
+
+    currency = state.get("currency", "")
+
+    def account_name(acc_id):
+        return next((a["name"] for a in state["accounts"] if a["id"] == acc_id), acc_id or "")
+
+    lines = []
+    for t in shown:
+        acc = account_name(t.get("accountId"))
+        if t.get("type") == "income":
+            lines.append(f'{t.get("date")} | income | +{t.get("amount", 0):.2f} {currency} | "{t.get("description", "")}" | {acc}')
+        elif t.get("type") == "expense":
+            b = bucket_label(state, t.get("bucketId"))
+            lines.append(f'{t.get("date")} | expense | -{t.get("amount", 0):.2f} {currency} | {b} | "{t.get("description", "")}" | {acc}')
+        else:
+            lines.append(f'{t.get("date")} | {t.get("type")} | {t.get("amount", 0):.2f} {currency} | "{t.get("description", "")}"')
+
+    header = f"Showing {len(shown)} of {total_matches} matching transaction(s), newest first:"
+    return header + "\n" + "\n".join(lines)
+
+
 def get_summary(state):
     totals = {b["id"]: 0.0 for b in state["buckets"]}
     for t in state["transactions"]:
@@ -276,6 +334,20 @@ TOOLS = [
         "description": "Get approximate current balances for every primary Profit First bucket in this tracker.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
+    {
+        "name": "list_transactions",
+        "description": "List individual transactions (newest first), optionally filtered by type, bucket, or a start date. Use this for specific questions like \"what did I spend on X\" or \"show my last few transactions\" - get_summary only gives bucket totals, not line items.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "number", "description": "Max transactions to return, default 20, max 200"},
+                "type": {"type": "string", "enum": ["income", "expense"], "description": "Filter to just income or just expenses"},
+                "bucket": {"type": "string", "description": 'Filter to transactions touching one bucket, by name (e.g. "Opex")'},
+                "since": {"type": "string", "description": "YYYY-MM-DD - only transactions on or after this date"},
+            },
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -321,6 +393,8 @@ def handle_mcp(body):
                 text = log_expense(state, args)
             elif name == "get_summary":
                 text = get_summary(state)
+            elif name == "list_transactions":
+                text = list_transactions(state, args)
             else:
                 raise ToolError(f"Unknown tool: {name}")
             write_state(state)
