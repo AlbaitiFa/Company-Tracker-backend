@@ -21,12 +21,16 @@ the HTML page embeds it (see the sync block near the top of
 profit-first-tracker.html) and you paste it into Claude's connector setup
 as the Authorization header when you add /mcp as a custom connector.
 
-Storage is a single JSON file next to this script (data.json). Good enough
-for one team's tracker; not built for concurrent high-volume writes.
+Storage is a single key in an Upstash Redis database (free tier, REST API,
+no SDK needed) rather than a local file - a host like Render rebuilds the
+filesystem from scratch on every deploy, which silently wipes a local file.
+Needs two more env vars: UPSTASH_REDIS_REST_URL and
+UPSTASH_REDIS_REST_TOKEN, both copy-pasteable straight from the Upstash
+console for your database.
 
-NOTE ON AUTH: this is a shared secret embedded in client-side HTML - anyone
-with the file's source can read it and hit this API directly. That's an
-acceptable MVP tradeoff for an internal tool with a small, trusted team;
+NOTE ON AUTH: SYNC_TOKEN is a shared secret embedded in client-side HTML -
+anyone with the file's source can read it and hit this API directly. That's
+an acceptable MVP tradeoff for an internal tool with a small, trusted team;
 move to per-user login when this graduates to the real Laravel backend.
 """
 
@@ -36,31 +40,60 @@ import sys
 import time
 import random
 import string
+import urllib.request
+import urllib.error
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("PORT", 8787))
-DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.json")
 TOKEN = os.environ.get("SYNC_TOKEN")
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+STATE_KEY = "profit_first_tracker_state"
 
 if not TOKEN:
     print("Set SYNC_TOKEN before starting, e.g.:")
     print("  SYNC_TOKEN=$(python3 -c \"import secrets; print(secrets.token_hex(32))\") python3 server.py")
     sys.exit(1)
 
-# ---- state file helpers ----------------------------------------------
+if not UPSTASH_URL or not UPSTASH_TOKEN:
+    print("Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN before starting")
+    print("(from your Upstash Redis database's console page).")
+    sys.exit(1)
+
+# ---- state storage (Upstash Redis REST API) -----------------------------
+
+def _upstash_request(method, path, body=None):
+    req = urllib.request.Request(
+        UPSTASH_URL.rstrip("/") + path,
+        data=body,
+        method=method,
+        headers={"Authorization": "Bearer " + UPSTASH_TOKEN},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
+
 
 def read_state():
     try:
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+        result = _upstash_request("GET", "/get/" + STATE_KEY)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+        print("Upstash read failed:", e, file=sys.stderr)
+        return None
+    value = result.get("result")
+    if value is None:
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
         return None
 
 
 def write_state(state):
-    with open(DATA_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    body = json.dumps(state).encode("utf-8")
+    result = _upstash_request("POST", "/set/" + STATE_KEY, body=body)
+    if result.get("result") != "OK":
+        raise RuntimeError(f"Upstash write did not confirm OK: {result}")
 
 
 def round2(v):
@@ -401,6 +434,8 @@ def handle_mcp(body):
             return 200, {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": text}], "isError": False}}
         except ToolError as e:
             return 200, {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": str(e)}], "isError": True}}
+        except Exception as e:
+            return 200, {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Storage error, transaction not saved: {e}"}], "isError": True}}
 
     return 400, {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
 
@@ -450,7 +485,10 @@ class Handler(BaseHTTPRequestHandler):
                 state = json.loads(self._body())
             except json.JSONDecodeError:
                 return self._send(400, {"error": "Invalid JSON body"})
-            write_state(state)
+            try:
+                write_state(state)
+            except Exception as e:
+                return self._send(502, {"error": f"Storage write failed: {e}"})
             return self._send(200, {"ok": True})
         self._send(404, {"error": "Not found"})
 
