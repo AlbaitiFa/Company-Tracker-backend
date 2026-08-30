@@ -660,25 +660,39 @@
     return fetch(SYNC_URL + "/api/state", { headers: { "Authorization": "Bearer " + SYNC_TOKEN } })
       .then(function (res) { return res.ok ? res.json() : null; })
       .then(function (remoteState) {
-        var added = 0;
+        var changed = 0;
         if (remoteState && Array.isArray(remoteState.transactions)) {
+          // Transactions merge additively across devices - never dropped,
+          // never overwritten, just unioned by id.
           var localIds = {};
           state.transactions.forEach(function (t) { localIds[t.id] = true; });
           remoteState.transactions.forEach(function (t) {
-            if (!localIds[t.id]) { state.transactions.push(t); added++; }
+            if (!localIds[t.id]) { state.transactions.push(t); changed++; }
+          });
+
+          // business/accounts/buckets are configuration, not per-device data -
+          // the server is always authoritative for these. Without this, a
+          // sync from a device with empty/default local storage would merge
+          // in the real transactions but then push its own default business
+          // name and default accounts over the server's real ones.
+          ["business", "accounts", "buckets", "currency"].forEach(function (key) {
+            if (remoteState[key] !== undefined && JSON.stringify(remoteState[key]) !== JSON.stringify(state[key])) {
+              state[key] = remoteState[key];
+              changed++;
+            }
           });
         }
-        if (added > 0) {
+        if (changed > 0) {
           localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
           render();
         }
         pushStateToServer();
-        if (added > 0) {
-          showToast(added === 1 ? "1 new transaction synced." : (added + " new transactions synced."));
+        if (changed > 0) {
+          showToast("Synced with server.");
         } else if (!silent) {
           showToast("Up to date.");
         }
-        return added;
+        return changed;
       })
       .catch(function () { if (!silent) showToast("Sync failed — check connection."); return 0; });
   }
