@@ -146,15 +146,40 @@ def compute_income_split(state, base):
     return amounts
 
 
-def resolve_account_id(state, account_name):
-    if account_name:
-        for a in state["accounts"]:
-            if a["id"] == account_name or a["name"].lower() == str(account_name).lower():
-                return a["id"]
+def default_account_id(state):
     default_id = state.get("defaultAccountId")
     if default_id and any(a["id"] == default_id for a in state["accounts"]):
         return default_id
     return state["accounts"][0]["id"] if state["accounts"] else "cash"
+
+
+def find_account_id(state, account_name):
+    """Strict lookup only - no fallback. Returns None if account_name doesn't
+    match any real account, so callers can tell 'not given' apart from
+    'given but wrong' and raise a clear error on the latter instead of
+    silently substituting the default account (a real bug this caused once -
+    a payout meant for a personal account landed in the company's main
+    account because the name didn't match anything)."""
+    for a in state["accounts"]:
+        if a["id"] == account_name or a["name"].lower() == str(account_name).lower():
+            return a["id"]
+    return None
+
+
+def resolve_account_id(state, account_name, tool_error_context=None):
+    """account_name not given -> the app's default account, silently, as
+    intended. account_name given but no match -> raises ToolError (unless
+    tool_error_context is None, kept only for back-compat call sites that
+    haven't been reviewed for strictness yet)."""
+    if not account_name:
+        return default_account_id(state)
+    found = find_account_id(state, account_name)
+    if found:
+        return found
+    if tool_error_context is None:
+        return default_account_id(state)
+    names = ", ".join(a["name"] for a in state["accounts"])
+    raise ToolError(f'Unknown account "{account_name}" for {tool_error_context}. Available accounts: {names}')
 
 
 def resolve_bucket_id(state, bucket_name):
@@ -399,7 +424,7 @@ def log_income(state, args):
     if not description:
         raise ToolError("description is required.")
     tx_date = args.get("date") or today_str()
-    account_id = resolve_account_id(state, args.get("account"))
+    account_id = resolve_account_id(state, args.get("account"), tool_error_context="log_income's account")
     cap_sum = sum(float(b.get("cap") or 0) for b in splittable_buckets(state))
     if cap_sum <= 0:
         raise ToolError("No bucket CAP percentages are set yet - set those up in the app first.")
@@ -458,7 +483,7 @@ def log_expense(state, args):
         names = ", ".join(b["name"] for b in state["buckets"])
         raise ToolError(f'Unknown bucket "{args.get("bucket")}". Available buckets: {names}')
     tx_date = args.get("date") or today_str()
-    account_id = resolve_account_id(state, args.get("account"))
+    account_id = resolve_account_id(state, args.get("account"), tool_error_context="log_expense's account")
     affects_bucket = args.get("affects_bucket", True)
     affects_account = args.get("affects_account", True)
 
@@ -502,13 +527,13 @@ def log_payout(state, args):
         names = ", ".join(b["name"] for b in state["buckets"])
         raise ToolError(f'Unknown bucket "{args.get("bucket")}". Available buckets: {names}')
     tx_date = args.get("date") or today_str()
-    from_account_id = resolve_account_id(state, args.get("from_account"))
+    from_account_id = resolve_account_id(state, args.get("from_account"), tool_error_context="log_payout's from_account")
     to_account_id = None
     if args.get("to_account"):
-        to_account_id = resolve_account_id(state, args.get("to_account"))
+        to_account_id = find_account_id(state, args["to_account"])
         if not to_account_id:
             names = ", ".join(a["name"] for a in state["accounts"])
-            raise ToolError(f'Unknown account "{args.get("to_account")}". Available accounts: {names}')
+            raise ToolError(f'Unknown account "{args["to_account"]}" for log_payout\'s to_account. Available accounts: {names}')
 
     tx = {
         "id": uid(),
@@ -742,7 +767,7 @@ TOOLS = [
     },
     {
         "name": "get_summary",
-        "description": "Get approximate current balances for every primary Profit First bucket in this tracker.",
+        "description": "Get current confirmed/pending balances, CAP/TAP percentages, and milestone pacing for every primary Profit First bucket - the same floor-and-cascade math the app itself uses, not an approximation.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
