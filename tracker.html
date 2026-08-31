@@ -606,7 +606,9 @@
         { id: uid(), name: "Main Account", status: "", type: "company" },
         { id: CASH_ACCOUNT_ID, name: "Cash on hand", status: "", type: "company" }
       ],
-      transactions: []
+      transactions: [],
+      deletedTransactionIds: [],
+      stateUpdatedAt: 0
     };
   }
 
@@ -631,6 +633,16 @@
   function hasUnexportedChanges() { try { return localStorage.getItem(DIRTY_KEY) === "1"; } catch (e) { return false; } }
 
   function persist() {
+    // Backfill updatedAt for any transaction a code path pushed directly
+    // (wire fees, split rows, distributions) instead of going through
+    // saveTx() - every transaction needs one before it can be synced, or
+    // it can't take part in the merge in reconcileState().
+    state.transactions.forEach(function (t) { if (!t.updatedAt) t.updatedAt = t.createdAt || Date.now(); });
+    // A coarse "this device touched its state at this instant" stamp -
+    // reconcileState() uses it to decide which side's whole settings bundle
+    // (business/accounts/buckets/etc.) wins when they differ, since there's
+    // no clean per-field merge for something like "the current bucket list".
+    state.stateUpdatedAt = Date.now();
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     markDirty();
     pushStateToServer();
@@ -638,51 +650,90 @@
 
   function syncEnabled() { return !!(SYNC_URL && SYNC_TOKEN); }
 
-  // Pulls the server's copy and merges in any transactions logged there
-  // (e.g. by Claude via chat) that aren't in this device's state yet -
-  // additive only, never removes or edits a transaction that's already here -
-  // then always pushes the merged result back. That push is what makes this
-  // self-healing: if the server's copy was ever wiped (e.g. a host redeploy
-  // with no persistent disk), this device's localStorage is the real source
-  // of truth and re-populates it automatically on the next sync.
+  var SETTINGS_FIELDS = [
+    "business", "accounts", "buckets", "currency", "trackMaterials", "companyDebt", "owners",
+    "reinvestPct", "distributionCadence", "fiscalYearStart", "distributionAnchorOverride",
+    "milestoneMode", "milestoneAmount", "milestonePercent", "milestoneWindowStart",
+    "milestoneAccumulated", "milestoneStepsApplied", "milestoneStepsLog", "defaultAccountId",
+    "version"
+  ];
+
+  // Merges two full state snapshots into one, symmetrically - either side
+  // can be passed as base or incoming and the result is the same. This is
+  // what makes syncing safe regardless of which device pulls, pushes, or
+  // deletes first:
+  //  - deletedTransactionIds: union of both sides.
+  //  - transactions: per-id union; present on only one side, kept; present
+  //    on both, whichever has the later updatedAt (falling back to
+  //    createdAt for old records) wins; a tombstoned id is dropped
+  //    regardless of which side has it.
+  //  - the settings bundle (business/accounts/buckets/etc.): taken wholesale
+  //    from whichever side has the newer stateUpdatedAt, since there's no
+  //    clean per-field merge for something like "the current bucket list".
+  // Mirrors server.py's reconcile_state() - keep both in sync.
+  function reconcileState(base, incoming) {
+    var result = {};
+    Object.keys(base).forEach(function (k) { result[k] = base[k]; });
+
+    var baseDeleted = Array.isArray(base.deletedTransactionIds) ? base.deletedTransactionIds : [];
+    var incomingDeleted = Array.isArray(incoming.deletedTransactionIds) ? incoming.deletedTransactionIds : [];
+    var tombstones = {};
+    baseDeleted.forEach(function (id) { tombstones[id] = true; });
+    incomingDeleted.forEach(function (id) { tombstones[id] = true; });
+    result.deletedTransactionIds = Object.keys(tombstones);
+
+    var merged = {};
+    (Array.isArray(base.transactions) ? base.transactions : []).forEach(function (t) { merged[t.id] = t; });
+    (Array.isArray(incoming.transactions) ? incoming.transactions : []).forEach(function (t) {
+      var existing = merged[t.id];
+      if (!existing) { merged[t.id] = t; return; }
+      var existingTime = existing.updatedAt || existing.createdAt || 0;
+      var incomingTime = t.updatedAt || t.createdAt || 0;
+      if (incomingTime > existingTime) merged[t.id] = t;
+    });
+    result.transactions = Object.keys(merged)
+      .filter(function (id) { return !tombstones[id]; })
+      .map(function (id) { return merged[id]; });
+
+    var baseStamp = base.stateUpdatedAt || 0;
+    var incomingStamp = incoming.stateUpdatedAt || 0;
+    var settingsSource = incomingStamp > baseStamp ? incoming : base;
+    SETTINGS_FIELDS.forEach(function (key) {
+      if (settingsSource[key] !== undefined) result[key] = settingsSource[key];
+    });
+    result.stateUpdatedAt = Math.max(baseStamp, incomingStamp);
+
+    return result;
+  }
+
+  // Pulls the server's copy, reconciles it against this device's local
+  // state (see reconcileState()), then always pushes the result back. That
+  // push is what makes this self-healing: if the server's copy was ever
+  // wiped (e.g. a host redeploy with no persistent disk), this device's
+  // localStorage is the real source of truth and re-populates it
+  // automatically on the next sync.
   function syncFromServer(silent) {
     if (!syncEnabled()) return Promise.resolve(0);
     return fetch(SYNC_URL + "/api/state", { headers: { "Authorization": "Bearer " + SYNC_TOKEN } })
       .then(function (res) { return res.ok ? res.json() : null; })
       .then(function (remoteState) {
-        var changed = 0;
+        var changed = false;
         if (remoteState && Array.isArray(remoteState.transactions)) {
-          // Transactions merge additively across devices - never dropped,
-          // never overwritten, just unioned by id.
-          var localIds = {};
-          state.transactions.forEach(function (t) { localIds[t.id] = true; });
-          remoteState.transactions.forEach(function (t) {
-            if (!localIds[t.id]) { state.transactions.push(t); changed++; }
-          });
-
-          // business/accounts/buckets are configuration, not per-device data -
-          // the server is always authoritative for these. Without this, a
-          // sync from a device with empty/default local storage would merge
-          // in the real transactions but then push its own default business
-          // name and default accounts over the server's real ones.
-          ["business", "accounts", "buckets", "currency"].forEach(function (key) {
-            if (remoteState[key] !== undefined && JSON.stringify(remoteState[key]) !== JSON.stringify(state[key])) {
-              state[key] = remoteState[key];
-              changed++;
-            }
-          });
+          var before = JSON.stringify(state);
+          state = reconcileState(state, remoteState);
+          changed = before !== JSON.stringify(state);
         }
-        if (changed > 0) {
+        if (changed) {
           localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
           render();
         }
         pushStateToServer();
-        if (changed > 0) {
+        if (changed) {
           showToast("Synced with server.");
         } else if (!silent) {
           showToast("Up to date.");
         }
-        return changed;
+        return changed ? 1 : 0;
       })
       .catch(function () { if (!silent) showToast("Sync failed — check connection."); return 0; });
   }
@@ -2432,6 +2483,11 @@
       return { frequency: freq, nextDate: advanceRecurringDate(date, freq), active: true };
     }
     function saveTx(newTx) {
+      // updatedAt is what a two-sided merge uses to pick a winner when the
+      // same transaction id was independently changed on two devices - see
+      // reconcileState(). It has to be set on every create AND every edit,
+      // here at the one place both paths pass through.
+      newTx.updatedAt = Date.now();
       if (editingTx) {
         newTx.id = editingTx.id;
         newTx.createdAt = editingTx.createdAt;
@@ -2647,6 +2703,12 @@
       openConfirm("Delete this transaction? This can't be undone.", "Delete", true).then(function (ok) {
         if (!ok) return;
         state.transactions = state.transactions.filter(function (t) { return t.id !== id; });
+        // Record a tombstone so this deletion survives a stale device that
+        // hasn't synced yet - without this, that device's next save would
+        // silently push its still-has-the-old-entry copy back and undo the
+        // delete. See syncFromServer() for the other half of this.
+        if (!state.deletedTransactionIds) state.deletedTransactionIds = [];
+        if (state.deletedTransactionIds.indexOf(id) === -1) state.deletedTransactionIds.push(id);
         var reverted = undoIncomeMilestoneEffect(tx);
         persist(); render();
         showToast(reverted

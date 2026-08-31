@@ -92,8 +92,78 @@ def read_state():
         return None
 
 
+# Fields that travel together as one "Settings" bundle - whichever side has
+# the newer stateUpdatedAt wins the whole bundle, since these aren't a list
+# of independent items the way transactions are; there's no sane per-field
+# merge for "the business name" or "the current bucket list".
+_SETTINGS_FIELDS = [
+    "business", "accounts", "buckets", "currency", "trackMaterials", "companyDebt", "owners",
+    "reinvestPct", "distributionCadence", "fiscalYearStart", "distributionAnchorOverride",
+    "milestoneMode", "milestoneAmount", "milestonePercent", "milestoneWindowStart",
+    "milestoneAccumulated", "milestoneStepsApplied", "milestoneStepsLog", "defaultAccountId",
+    "version",
+]
+
+
+def reconcile_state(base, incoming):
+    """Merges two full state snapshots into one, symmetrically - either can
+    be passed as base or incoming and the result is the same. This is what
+    makes every write path safe against a stale write clobbering a newer
+    one, instead of relying on whoever pushes last winning outright:
+
+    - deletedTransactionIds: union of both sides.
+    - transactions: per-id union; a transaction present on only one side is
+      kept; present on both, the one with the later updatedAt (falling back
+      to createdAt for old records) wins; a tombstoned id is dropped
+      entirely regardless of which side has it.
+    - the settings bundle (business/accounts/buckets/etc.): taken wholesale
+      from whichever side has the newer stateUpdatedAt.
+
+    Mirrors tracker.html's reconcileState() - keep both in sync.
+    """
+    result = dict(base)
+
+    base_deleted = base.get("deletedTransactionIds") or []
+    incoming_deleted = incoming.get("deletedTransactionIds") or []
+    tombstones = set(base_deleted) | set(incoming_deleted)
+    result["deletedTransactionIds"] = list(tombstones)
+
+    merged = {}
+    for t in base.get("transactions") or []:
+        merged[t["id"]] = t
+    for t in incoming.get("transactions") or []:
+        existing = merged.get(t["id"])
+        if not existing:
+            merged[t["id"]] = t
+            continue
+        existing_time = existing.get("updatedAt") or existing.get("createdAt") or 0
+        incoming_time = t.get("updatedAt") or t.get("createdAt") or 0
+        if incoming_time > existing_time:
+            merged[t["id"]] = t
+    result["transactions"] = [t for tid, t in merged.items() if tid not in tombstones]
+
+    base_stamp = base.get("stateUpdatedAt") or 0
+    incoming_stamp = incoming.get("stateUpdatedAt") or 0
+    settings_source = incoming if incoming_stamp > base_stamp else base
+    for key in _SETTINGS_FIELDS:
+        if key in settings_source:
+            result[key] = settings_source[key]
+    result["stateUpdatedAt"] = max(base_stamp, incoming_stamp)
+
+    return result
+
+
 def write_state(state):
-    body = json.dumps(state).encode("utf-8")
+    # Always reconcile against whatever's currently stored rather than
+    # blindly overwriting - this is what makes every write path safe (the
+    # HTTP PUT from the app's own sync, an MCP tool call, or a direct fix),
+    # not just the client's own pull-before-push sequence. A write that
+    # tries to silently drop a transaction by just not including it no
+    # longer deletes it - deletion only happens through
+    # deletedTransactionIds now (see delete_transaction).
+    current = read_state()
+    merged = reconcile_state(current, state) if current else state
+    body = json.dumps(merged).encode("utf-8")
     result = _upstash_request("POST", "/set/" + STATE_KEY, body=body)
     if result.get("result") != "OK":
         raise RuntimeError(f"Upstash write did not confirm OK: {result}")
@@ -380,7 +450,41 @@ def check_milestone_steps(state, tx_real_revenue, tx_id):
                     {"txId": tx_id, "sourceId": step["sourceId"], "targetId": step["targetId"]}
                 )
         state["milestoneStepsApplied"] = already + applied
+        if applied > 0:
+            # Milestone steps mutate bucket.cap, which is part of the
+            # settings bundle reconcile_state() decides by stateUpdatedAt -
+            # without this, a step applied here could lose to a stale
+            # settings push from elsewhere that never saw it.
+            state["stateUpdatedAt"] = int(time.time() * 1000)
     return applied
+
+
+def revert_milestone_steps_for_tx(state, tx_id):
+    # Mirrors revertMilestoneStepsForTx() (~line 1483) - the app calls this
+    # whenever an income transaction that triggered milestone steps is
+    # deleted or has its amount edited, so those steps don't just stay
+    # permanently applied against a transaction that no longer justifies them.
+    log = state.get("milestoneStepsLog") or []
+    if not log:
+        return 0
+    remaining = []
+    reverted = 0
+    for entry in log:
+        if entry.get("txId") == tx_id:
+            source = bucket_by_id(state, entry.get("sourceId"))
+            target = bucket_by_id(state, entry.get("targetId"))
+            if source:
+                source["cap"] = round2(float(source.get("cap") or 0) + 1)
+            if target:
+                target["cap"] = round2(float(target.get("cap") or 0) - 1)
+            reverted += 1
+        else:
+            remaining.append(entry)
+    state["milestoneStepsLog"] = remaining
+    if reverted:
+        state["milestoneStepsApplied"] = max(0, (state.get("milestoneStepsApplied") or 0) - reverted)
+        state["stateUpdatedAt"] = int(time.time() * 1000)
+    return reverted
 
 
 def milestone_status_text(state):
@@ -450,6 +554,7 @@ def log_income(state, args):
         "historical": False,
         "recurring": None,
         "createdAt": int(time.time() * 1000),
+        "updatedAt": int(time.time() * 1000),
     }
     state["transactions"].append(tx)
 
@@ -499,6 +604,7 @@ def log_expense(state, args):
         "affectsAccount": bool(affects_account),
         "historical": False,
         "createdAt": int(time.time() * 1000),
+        "updatedAt": int(time.time() * 1000),
     }
     state["transactions"].append(tx)
     currency = state.get("currency", "")
@@ -546,6 +652,7 @@ def log_payout(state, args):
         "toAccountId": to_account_id,
         "toBucketId": None,
         "createdAt": int(time.time() * 1000),
+        "updatedAt": int(time.time() * 1000),
     }
     state["transactions"].append(tx)
     currency = state.get("currency", "")
@@ -683,8 +790,112 @@ def delete_transaction(state, args):
             "Pass it back exactly to confirm you have the right one."
         )
     state["transactions"] = [t for t in state["transactions"] if t.get("id") != tx_id]
+    # Tombstone the id so this deletion survives a stale client (a browser
+    # tab, or any session) that still has the old entry cached and would
+    # otherwise silently push it back on its next save. See tracker.html's
+    # syncFromServer() for the client-side half of this.
+    if state.get("deletedTransactionIds") is None:
+        state["deletedTransactionIds"] = []
+    if tx_id not in state["deletedTransactionIds"]:
+        state["deletedTransactionIds"].append(tx_id)
+    reverted = revert_milestone_steps_for_tx(state, tx_id)
     currency = state.get("currency", "")
-    return f'Deleted: {match.get("amount", 0):.2f} {currency} - "{match.get("description", "")}" on {match.get("date", "")}.'
+    msg = f'Deleted: {match.get("amount", 0):.2f} {currency} - "{match.get("description", "")}" on {match.get("date", "")}.'
+    if reverted:
+        msg += f" {reverted} CAP milestone step{'s' if reverted != 1 else ''} reversed."
+    return msg
+
+
+def edit_transaction(state, args):
+    tx_id = args.get("id")
+    if not tx_id:
+        raise ToolError("id is required - get it from list_transactions' [id] prefix.")
+    confirm_description = str(args.get("confirm_description") or "").strip().lower()
+    if not confirm_description:
+        raise ToolError(
+            "confirm_description is required - pass the transaction's current exact description "
+            "back, as a safety check that this is really the entry meant to be edited."
+        )
+    tx = next((t for t in state["transactions"] if t.get("id") == tx_id), None)
+    if not tx:
+        raise ToolError(f'No transaction found with id "{tx_id}".')
+    actual_description = str(tx.get("description") or "").strip().lower()
+    if confirm_description != actual_description:
+        raise ToolError(
+            f'confirm_description doesn\'t match - this transaction\'s current description is "{tx.get("description", "")}". '
+            "Pass it back exactly to confirm you have the right one."
+        )
+
+    changes = []
+
+    if "amount" in args and args["amount"] is not None:
+        try:
+            new_amount = round2(args["amount"])
+        except (TypeError, ValueError):
+            new_amount = 0
+        if not new_amount or new_amount <= 0:
+            raise ToolError("amount must be a positive number.")
+        if tx.get("type") == "income" and new_amount != tx.get("amount"):
+            # Same sequence the app's own edit flow uses: undo whatever
+            # milestone steps this transaction's old amount had triggered
+            # before recomputing the split and rechecking steps against the
+            # new amount - otherwise stale CAP shifts stick around forever.
+            revert_milestone_steps_for_tx(state, tx_id)
+        tx["amount"] = new_amount
+        changes.append("amount")
+        if tx.get("type") == "income":
+            tx["split"] = compute_income_split(state, new_amount)
+            changes.append("split")
+
+    if "description" in args and args["description"] is not None:
+        new_desc = str(args["description"]).strip()
+        if not new_desc:
+            raise ToolError("description can't be blank.")
+        tx["description"] = new_desc
+        changes.append("description")
+
+    if "date" in args and args["date"]:
+        tx["date"] = args["date"]
+        changes.append("date")
+
+    if "bucket" in args and args["bucket"] and tx.get("type") in ("expense", "payout"):
+        bucket_id = resolve_bucket_id(state, args["bucket"])
+        if not bucket_id:
+            names = ", ".join(b["name"] for b in state["buckets"])
+            raise ToolError(f'Unknown bucket "{args["bucket"]}". Available buckets: {names}')
+        tx["bucketId"] = bucket_id
+        changes.append("bucket")
+
+    if "account" in args and args["account"] and tx.get("type") in ("income", "expense"):
+        tx["accountId"] = resolve_account_id(state, args["account"], tool_error_context="edit_transaction's account")
+        changes.append("account")
+
+    if "from_account" in args and args["from_account"] and tx.get("type") == "payout":
+        tx["fromAccountId"] = resolve_account_id(state, args["from_account"], tool_error_context="edit_transaction's from_account")
+        changes.append("from_account")
+
+    if "to_account" in args and args["to_account"] and tx.get("type") == "payout":
+        found = find_account_id(state, args["to_account"])
+        if not found:
+            names = ", ".join(a["name"] for a in state["accounts"])
+            raise ToolError(f'Unknown account "{args["to_account"]}" for edit_transaction\'s to_account. Available accounts: {names}')
+        tx["toAccountId"] = found
+        changes.append("to_account")
+
+    if not changes:
+        raise ToolError("Nothing to change - pass at least one field to update (amount, description, date, bucket, account, from_account, to_account).")
+
+    tx["updatedAt"] = int(time.time() * 1000)
+
+    steps_applied = 0
+    if tx.get("type") == "income" and "amount" in changes:
+        steps_applied = check_milestone_steps(state, tx["amount"], tx_id)
+
+    currency = state.get("currency", "")
+    msg = f'Updated: {tx.get("amount", 0):.2f} {currency} - "{tx.get("description", "")}" on {tx.get("date", "")}. Changed: {", ".join(c for c in changes if c != "split")}.'
+    if steps_applied > 0:
+        msg += f" {steps_applied} CAP milestone step{'s' if steps_applied != 1 else ''} applied."
+    return msg
 
 
 # ---- MCP JSON-RPC plumbing ----------------------------------------------
@@ -791,15 +1002,41 @@ TOOLS = [
     },
     {
         "name": "delete_transaction",
-        "description": "Permanently delete one transaction by id (from list_transactions' [id] prefix). "
+        "description": "Permanently delete one transaction by id (from list_transactions' [id] prefix) - "
+        "for an entry that shouldn't exist at all (a duplicate, something logged against the wrong "
+        "tracker). For fixing a wrong field on an otherwise-real entry (wrong amount, wrong bucket, "
+        "wrong account), use edit_transaction instead - it's safer and keeps the transaction's history. "
         "Requires echoing back the transaction's exact description as confirm_description - a safety "
-        "check against deleting the wrong entry. To correct a mistake: delete the bad entry, then log "
-        "a fresh one with the right details. Confirm with Albaiti before deleting anything real.",
+        "check against deleting the wrong entry. Confirm with Albaiti before deleting anything real.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "id": {"type": "string", "description": "The transaction id, from list_transactions"},
                 "confirm_description": {"type": "string", "description": "The transaction's exact description, echoed back to confirm this is the right one"},
+            },
+            "required": ["id", "confirm_description"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "edit_transaction",
+        "description": "Correct a field on an existing transaction (amount, description, date, bucket, "
+        "account) by id, from list_transactions' [id] prefix. Requires echoing back the transaction's "
+        "current exact description as confirm_description - a safety check against editing the wrong "
+        "entry. Editing an income transaction's amount recomputes its bucket split and re-checks CAP "
+        "milestone stepping, same as the app itself. Only pass the fields you want to change.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "The transaction id, from list_transactions"},
+                "confirm_description": {"type": "string", "description": "The transaction's current exact description, echoed back to confirm this is the right one"},
+                "amount": {"type": "number", "description": "New amount, if changing it"},
+                "description": {"type": "string", "description": "New description, if changing it"},
+                "date": {"type": "string", "description": "New date (YYYY-MM-DD), if changing it"},
+                "bucket": {"type": "string", "description": "New bucket, by name - expense/payout only"},
+                "account": {"type": "string", "description": "New account, by name - income/expense only"},
+                "from_account": {"type": "string", "description": "New source account, by name - payout only"},
+                "to_account": {"type": "string", "description": "New destination account, by name - payout only"},
             },
             "required": ["id", "confirm_description"],
             "additionalProperties": False,
@@ -858,6 +1095,8 @@ def handle_mcp(body):
                 text = confirm_pending(state, args)
             elif name == "delete_transaction":
                 text = delete_transaction(state, args)
+            elif name == "edit_transaction":
+                text = edit_transaction(state, args)
             else:
                 raise ToolError(f"Unknown tool: {name}")
             write_state(state)
