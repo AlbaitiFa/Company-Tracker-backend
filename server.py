@@ -34,6 +34,7 @@ an acceptable MVP tradeoff for an internal tool with a small, trusted team;
 move to per-user login when this graduates to the real Laravel backend.
 """
 
+import calendar
 import json
 import math
 import os
@@ -357,6 +358,30 @@ def check_milestone_steps(state, tx_real_revenue, tx_id):
     return applied
 
 
+def milestone_status_text(state):
+    # Mirrors renderMilestonePanel() (~line 1503) so this reads exactly like
+    # the app's own "Milestone pacing" panel.
+    milestone_amount = get_milestone_amount(state)
+    if not milestone_amount or milestone_amount <= 0 or not bucket_by_id(state, "opex"):
+        return "No milestone tracking configured."
+    ensure_milestone_window_current(state)
+    accumulated = state.get("milestoneAccumulated") or 0
+    into_window = accumulated - (math.floor(accumulated / milestone_amount) * milestone_amount)
+    remaining = round2(max(0, milestone_amount - into_window))
+    steps_so_far = state.get("milestoneStepsApplied") or 0
+    window_start = state.get("milestoneWindowStart")
+    if window_start:
+        y, m = window_start.split("-")[0], window_start.split("-")[1]
+        window_note = f"{calendar.month_name[int(m)]} {y}"
+    else:
+        window_note = "No income logged yet"
+    currency = state.get("currency", "")
+    return (
+        f"{window_note} - {steps_so_far} step{'s' if steps_so_far != 1 else ''} applied this window - "
+        f"{remaining:.2f} {currency} of Real Revenue until the next automatic step."
+    )
+
+
 # ---- MCP tool implementations ------------------------------------------
 
 class ToolError(Exception):
@@ -549,18 +574,33 @@ def list_transactions(state, args):
     def account_name(acc_id):
         return next((a["name"] for a in state["accounts"] if a["id"] == acc_id), acc_id or "")
 
+    def notes_suffix(t):
+        notes = (t.get("notes") or "").strip()
+        return f' | notes: "{notes}"' if notes else ""
+
     lines = []
     for t in shown:
         acc = account_name(t.get("accountId"))
+        tid = t.get("id", "")
         if t.get("type") == "income":
-            lines.append(f'{t.get("date")} | income | +{t.get("amount", 0):.2f} {currency} | "{t.get("description", "")}" | {acc}')
+            pending_tag = " (pending)" if t.get("pending") else ""
+            lines.append(
+                f'[{tid}] {t.get("date")} | income | +{t.get("amount", 0):.2f} {currency}{pending_tag} | '
+                f'"{t.get("description", "")}" | {acc}{notes_suffix(t)}'
+            )
         elif t.get("type") == "expense":
             b = bucket_label(state, t.get("bucketId"))
-            lines.append(f'{t.get("date")} | expense | -{t.get("amount", 0):.2f} {currency} | {b} | "{t.get("description", "")}" | {acc}')
+            lines.append(
+                f'[{tid}] {t.get("date")} | expense | -{t.get("amount", 0):.2f} {currency} | {b} | '
+                f'"{t.get("description", "")}" | {acc}{notes_suffix(t)}'
+            )
         else:
-            lines.append(f'{t.get("date")} | {t.get("type")} | {t.get("amount", 0):.2f} {currency} | "{t.get("description", "")}"')
+            lines.append(
+                f'[{tid}] {t.get("date")} | {t.get("type")} | {t.get("amount", 0):.2f} {currency} | '
+                f'"{t.get("description", "")}"{notes_suffix(t)}'
+            )
 
-    header = f"Showing {len(shown)} of {total_matches} matching transaction(s), newest first:"
+    header = f"Showing {len(shown)} of {total_matches} matching transaction(s), newest first. [id] is what delete_transaction needs:"
     return header + "\n" + "\n".join(lines)
 
 
@@ -584,11 +624,42 @@ def get_summary(state):
             continue
         confirmed = round2(derived["bucketConfirmed"].get(b["id"], 0))
         pending = round2(derived["bucketPending"].get(b["id"], 0))
-        line = f'{b["name"]}: {confirmed:.2f} {currency}'
+        cap = b.get("cap")
+        tap = b.get("tap")
+        line = f'{b["name"]}: {confirmed:.2f} {currency} (CAP {cap}% / TAP {tap}%)'
         if pending:
             line += f" (+{pending:.2f} pending)"
         lines.append(line)
-    return "Current bucket balances (floor-and-cascade applied, same as the app):\n" + "\n".join(lines)
+    return (
+        "Current bucket balances (floor-and-cascade applied, same as the app):\n"
+        + "\n".join(lines)
+        + "\n\nMilestone pacing: "
+        + milestone_status_text(state)
+    )
+
+
+def delete_transaction(state, args):
+    tx_id = args.get("id")
+    if not tx_id:
+        raise ToolError("id is required - get it from list_transactions' [id] prefix.")
+    confirm_description = str(args.get("confirm_description") or "").strip().lower()
+    if not confirm_description:
+        raise ToolError(
+            "confirm_description is required - pass the transaction's exact description back, "
+            "as a safety check that this is really the entry meant to be deleted."
+        )
+    match = next((t for t in state["transactions"] if t.get("id") == tx_id), None)
+    if not match:
+        raise ToolError(f'No transaction found with id "{tx_id}".')
+    actual_description = str(match.get("description") or "").strip().lower()
+    if confirm_description != actual_description:
+        raise ToolError(
+            f'confirm_description doesn\'t match - this transaction\'s description is "{match.get("description", "")}". '
+            "Pass it back exactly to confirm you have the right one."
+        )
+    state["transactions"] = [t for t in state["transactions"] if t.get("id") != tx_id]
+    currency = state.get("currency", "")
+    return f'Deleted: {match.get("amount", 0):.2f} {currency} - "{match.get("description", "")}" on {match.get("date", "")}.'
 
 
 # ---- MCP JSON-RPC plumbing ----------------------------------------------
@@ -693,6 +764,22 @@ TOOLS = [
         "description": "Confirm all pending income - moves every pending income split into each bucket's confirmed balance. Same as the app's \"Confirm all\" button. Use once Albaiti says a payment's split has actually been allocated or wired.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
+    {
+        "name": "delete_transaction",
+        "description": "Permanently delete one transaction by id (from list_transactions' [id] prefix). "
+        "Requires echoing back the transaction's exact description as confirm_description - a safety "
+        "check against deleting the wrong entry. To correct a mistake: delete the bad entry, then log "
+        "a fresh one with the right details. Confirm with Albaiti before deleting anything real.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "The transaction id, from list_transactions"},
+                "confirm_description": {"type": "string", "description": "The transaction's exact description, echoed back to confirm this is the right one"},
+            },
+            "required": ["id", "confirm_description"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -744,6 +831,8 @@ def handle_mcp(body):
                 text = list_transactions(state, args)
             elif name == "confirm_pending":
                 text = confirm_pending(state, args)
+            elif name == "delete_transaction":
+                text = delete_transaction(state, args)
             else:
                 raise ToolError(f"Unknown tool: {name}")
             write_state(state)
