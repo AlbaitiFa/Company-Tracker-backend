@@ -35,6 +35,7 @@ move to per-user login when this graduates to the real Laravel backend.
 """
 
 import json
+import math
 import os
 import sys
 import time
@@ -42,7 +43,7 @@ import random
 import string
 import urllib.request
 import urllib.error
-from datetime import date
+from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("PORT", 8787))
@@ -97,8 +98,22 @@ def write_state(state):
         raise RuntimeError(f"Upstash write did not confirm OK: {result}")
 
 
+# Python's round() uses banker's rounding (.5 -> nearest even); JS's
+# Math.round() always rounds .5 up. These two mirror
+# profit-first-tracker.html's round2()/Math.round() exactly so a split like
+# "5% of 250 = 12.5" rounds to 13 here too, not 12.
+_JS_EPSILON = 2.220446049250313e-16
+
+
+def js_round(x):
+    if x >= 0:
+        return math.floor(x + 0.5)
+    return -math.floor(-x + 0.5)
+
+
 def round2(v):
-    return round(float(v) + 1e-9, 2)
+    v = float(v)
+    return js_round((v + _JS_EPSILON) * 100) / 100
 
 
 def uid():
@@ -124,7 +139,7 @@ def compute_income_split(state, base):
         if i == len(buckets) - 1:
             amounts[b["id"]] = round2(base - running)
         else:
-            a = round(base * (float(b.get("cap") or 0)) / 100)
+            a = js_round(base * (float(b.get("cap") or 0)) / 100)
             amounts[b["id"]] = a
             running += a
     return amounts
@@ -155,6 +170,193 @@ def bucket_label(state, bucket_id):
     return bucket_id
 
 
+def bucket_by_id(state, bucket_id):
+    return next((b for b in state["buckets"] if b["id"] == bucket_id), None)
+
+
+# ---- Derivation engine ---------------------------------------------------
+# Faithful port of profit-first-tracker.html's computeDerived() (~line 701)
+# and the milestone-stepping functions (~line 1413-1477). Both sides need to
+# agree on this, or chat-logged and app-logged transactions render
+# differently - if the app's version of these functions changes, mirror the
+# change here too.
+
+_FLOOR_BASE_PRIORITY = ["opex", "profit", "tax", "ownerspay"]
+
+
+def floor_priority(state):
+    order = list(_FLOOR_BASE_PRIORITY)
+    for b in state["buckets"]:
+        if b["id"] not in order and b.get("tier") == "secondary":
+            order.append(b["id"])
+    return order
+
+
+def compute_derived(state):
+    bucket_confirmed = {b["id"]: 0.0 for b in state["buckets"]}
+    bucket_pending = {b["id"]: 0.0 for b in state["buckets"]}
+    account_balances = {a["id"]: 0.0 for a in state["accounts"]}
+
+    sorted_tx = sorted(state["transactions"], key=lambda t: (t.get("date", ""), t.get("createdAt", 0)))
+    priority = floor_priority(state)
+    tx_floor_notes = {}
+
+    def draw_from_bucket(bucket_id, amount):
+        if bucket_id not in bucket_confirmed:
+            return None
+        own_avail = max(bucket_confirmed[bucket_id], 0)
+        take = min(own_avail, amount)
+        bucket_confirmed[bucket_id] = round2(bucket_confirmed[bucket_id] - take)
+        remaining = round2(amount - take)
+        if remaining <= 0.004:
+            return None
+        shortfall = remaining
+        covered_by = []
+        for bid in priority:
+            if bid == bucket_id:
+                continue
+            if remaining <= 0.004 or bid not in bucket_confirmed:
+                continue
+            avail = max(bucket_confirmed[bid], 0)
+            pull = min(avail, remaining)
+            if pull > 0:
+                bucket_confirmed[bid] = round2(bucket_confirmed[bid] - pull)
+                covered_by.append({"id": bid, "amount": pull})
+                remaining = round2(remaining - pull)
+        return {"shortfall": shortfall, "coveredBy": covered_by, "stillShort": remaining}
+
+    for tx in sorted_tx:
+        ttype = tx.get("type")
+        if ttype == "income":
+            if not tx.get("historical") and tx.get("accountId") in account_balances:
+                account_balances[tx["accountId"]] += tx["amount"]
+            for bid, amt in (tx.get("split") or {}).items():
+                if bid not in bucket_confirmed:
+                    continue
+                if tx.get("pending"):
+                    bucket_pending[bid] += amt
+                else:
+                    bucket_confirmed[bid] += amt
+        elif ttype == "expense":
+            if tx.get("affectsAccount") and not tx.get("historical") and tx.get("accountId") in account_balances:
+                account_balances[tx["accountId"]] -= tx["amount"]
+            if tx.get("affectsBucket") and tx.get("bucketId") in bucket_confirmed:
+                r = draw_from_bucket(tx["bucketId"], tx["amount"])
+                if r:
+                    tx_floor_notes[tx["id"]] = r
+        elif ttype == "transfer":
+            if not tx.get("historical"):
+                if tx.get("accountId") in account_balances:
+                    account_balances[tx["accountId"]] -= tx["amount"]
+                if tx.get("toAccountId") in account_balances:
+                    account_balances[tx["toAccountId"]] += tx["amount"]
+        elif ttype == "payout":
+            if tx.get("bucketId") in bucket_confirmed:
+                r = draw_from_bucket(tx["bucketId"], tx["amount"])
+                if r:
+                    tx_floor_notes[tx["id"]] = r
+            if tx.get("toBucketId") and tx["toBucketId"] in bucket_confirmed:
+                bucket_confirmed[tx["toBucketId"]] += tx["amount"]
+            if not tx.get("historical"):
+                if tx.get("toAccountId") and tx["toAccountId"] in account_balances:
+                    account_balances[tx["toAccountId"]] += tx["amount"]
+                if tx.get("fromAccountId") and tx["fromAccountId"] in account_balances:
+                    account_balances[tx["fromAccountId"]] -= tx["amount"]
+
+    return {
+        "bucketConfirmed": bucket_confirmed,
+        "bucketPending": bucket_pending,
+        "accountBalances": account_balances,
+        "txFloorNotes": tx_floor_notes,
+    }
+
+
+def month_start_str(date_str):
+    return date_str[:7] + "-01"
+
+
+def monthly_real_revenue(state):
+    now = datetime.utcnow()
+    month_start = f"{now.year:04d}-{now.month:02d}-01"
+    total = 0.0
+    for t in state["transactions"]:
+        if t.get("type") == "income" and t.get("date", "") >= month_start:
+            total += t["amount"] - (t.get("materialsCost") or 0)
+    return round2(total)
+
+
+def get_milestone_amount(state):
+    if state.get("milestoneMode") == "percent":
+        return round2((state.get("milestonePercent") or 0) / 100 * monthly_real_revenue(state))
+    return state["milestoneAmount"] if state.get("milestoneAmount") is not None else 100000
+
+
+def ensure_milestone_window_current(state):
+    today_month_start = month_start_str(today_str())
+    if state.get("milestoneWindowStart") != today_month_start:
+        state["milestoneWindowStart"] = today_month_start
+        state["milestoneStepsApplied"] = 0
+        state["milestoneStepsLog"] = []
+    state["milestoneAccumulated"] = monthly_real_revenue(state)
+
+
+_INCREASE_PRIORITY = ["profit", "ownerspay", "tax", "opex"]
+_DECREASE_PRIORITY = ["opex", "tax", "ownerspay", "profit"]
+
+
+def apply_one_milestone_step(state):
+    if not bucket_by_id(state, "opex"):
+        return None
+    target = None
+    for bid in _INCREASE_PRIORITY:
+        b = bucket_by_id(state, bid)
+        if b and float(b.get("cap") or 0) < float(b.get("tap") or 0):
+            target = b
+            break
+    if not target:
+        return None
+    source = None
+    for bid in _DECREASE_PRIORITY:
+        b = bucket_by_id(state, bid)
+        if not b or b is target:
+            continue
+        if float(b.get("cap") or 0) > float(b.get("tap") or 0):
+            source = b
+            break
+    if not source:
+        return None
+    source["cap"] = round2(float(source.get("cap") or 0) - 1)
+    target["cap"] = round2(float(target.get("cap") or 0) + 1)
+    return {"sourceId": source["id"], "targetId": target["id"]}
+
+
+def check_milestone_steps(state, tx_real_revenue, tx_id):
+    if not tx_real_revenue or tx_real_revenue <= 0:
+        return 0
+    milestone_amount = get_milestone_amount(state)
+    if not milestone_amount or milestone_amount <= 0:
+        return 0
+    if not bucket_by_id(state, "opex"):
+        return 0
+    ensure_milestone_window_current(state)
+    target_steps = int(state.get("milestoneAccumulated", 0) // milestone_amount)
+    already = state.get("milestoneStepsApplied") or 0
+    new_steps = target_steps - already
+    applied = 0
+    if new_steps > 0:
+        if state.get("milestoneStepsLog") is None:
+            state["milestoneStepsLog"] = []
+        for _ in range(new_steps):
+            step = apply_one_milestone_step(state)
+            if step:
+                applied += 1
+                state["milestoneStepsLog"].append(
+                    {"txId": tx_id, "sourceId": step["sourceId"], "targetId": step["targetId"]}
+                )
+        state["milestoneStepsApplied"] = already + applied
+    return applied
+
+
 # ---- MCP tool implementations ------------------------------------------
 
 class ToolError(Exception):
@@ -177,6 +379,12 @@ def log_income(state, args):
     if cap_sum <= 0:
         raise ToolError("No bucket CAP percentages are set yet - set those up in the app first.")
 
+    # Matches the app's own Add Transaction default: Pending is checked
+    # unless told otherwise. Pending income shows as a "+amount pending"
+    # badge on each bucket instead of landing in the confirmed balance,
+    # until confirm_pending() (or the app's "Confirm all") clears it.
+    pending = args.get("pending", True)
+
     split = compute_income_split(state, amount)
     tx = {
         "id": uid(),
@@ -188,15 +396,24 @@ def log_income(state, args):
         "materialsCost": 0,
         "accountId": account_id,
         "split": split,
-        "pending": False,
+        "pending": bool(pending),
         "historical": False,
         "recurring": None,
         "createdAt": int(time.time() * 1000),
     }
     state["transactions"].append(tx)
+
+    # Mirrors the app's income-save handler: milestone stepping fires right
+    # after the split is computed, using the same real-revenue figure.
+    steps_applied = check_milestone_steps(state, amount, tx["id"])
+
     bucket_lines = ", ".join(f"{bucket_label(state, bid)}: {amt:.2f}" for bid, amt in split.items())
     currency = state.get("currency", "")
-    return f'Income logged: {amount:.2f} {currency} - "{description}" on {tx_date}. Split -> {bucket_lines}.'
+    pending_note = " (pending - not yet confirmed)" if pending else ""
+    msg = f'Income logged: {amount:.2f} {currency} - "{description}" on {tx_date}{pending_note}. Split -> {bucket_lines}.'
+    if steps_applied > 0:
+        msg += f" {steps_applied} CAP milestone step{'s' if steps_applied != 1 else ''} applied."
+    return msg
 
 
 def log_expense(state, args):
@@ -217,6 +434,8 @@ def log_expense(state, args):
         raise ToolError(f'Unknown bucket "{args.get("bucket")}". Available buckets: {names}')
     tx_date = args.get("date") or today_str()
     account_id = resolve_account_id(state, args.get("account"))
+    affects_bucket = args.get("affects_bucket", True)
+    affects_account = args.get("affects_account", True)
 
     tx = {
         "id": uid(),
@@ -226,14 +445,65 @@ def log_expense(state, args):
         "amount": amount,
         "bucketId": bucket_id,
         "accountId": account_id,
-        "affectsBucket": True,
-        "affectsAccount": True,
+        "affectsBucket": bool(affects_bucket),
+        "affectsAccount": bool(affects_account),
         "historical": False,
         "createdAt": int(time.time() * 1000),
     }
     state["transactions"].append(tx)
     currency = state.get("currency", "")
-    return f'Expense logged: {amount:.2f} {currency} from {bucket_label(state, bucket_id)} - "{description}" on {tx_date}.'
+    flags_note = ""
+    if not affects_bucket:
+        flags_note = f" (real cash left the account, but {bucket_label(state, bucket_id)}'s allocation stays intact)"
+    elif not affects_account:
+        flags_note = " (bucket allocation only, no real account balance change)"
+    return f'Expense logged: {amount:.2f} {currency} from {bucket_label(state, bucket_id)} - "{description}" on {tx_date}{flags_note}.'
+
+
+def log_payout(state, args):
+    try:
+        amount = round2(args.get("amount"))
+    except (TypeError, ValueError):
+        amount = 0
+    if not amount or amount <= 0:
+        raise ToolError("amount must be a positive number.")
+    description = str(args.get("description") or "").strip()
+    if not description:
+        raise ToolError("description is required.")
+    if not args.get("bucket"):
+        raise ToolError("bucket is required - which bucket this draw is against (e.g. Owner's Pay, Profit).")
+    bucket_id = resolve_bucket_id(state, args.get("bucket"))
+    if not bucket_id:
+        names = ", ".join(b["name"] for b in state["buckets"])
+        raise ToolError(f'Unknown bucket "{args.get("bucket")}". Available buckets: {names}')
+    tx_date = args.get("date") or today_str()
+    from_account_id = resolve_account_id(state, args.get("from_account"))
+    to_account_id = None
+    if args.get("to_account"):
+        to_account_id = resolve_account_id(state, args.get("to_account"))
+        if not to_account_id:
+            names = ", ".join(a["name"] for a in state["accounts"])
+            raise ToolError(f'Unknown account "{args.get("to_account")}". Available accounts: {names}')
+
+    tx = {
+        "id": uid(),
+        "type": "payout",
+        "date": tx_date,
+        "description": description,
+        "amount": amount,
+        "bucketId": bucket_id,
+        "fromAccountId": from_account_id,
+        "toAccountId": to_account_id,
+        "toBucketId": None,
+        "createdAt": int(time.time() * 1000),
+    }
+    state["transactions"].append(tx)
+    currency = state.get("currency", "")
+    dest = ""
+    if to_account_id:
+        to_name = next((a["name"] for a in state["accounts"] if a["id"] == to_account_id), to_account_id)
+        dest = f" to {to_name}"
+    return f'Payout logged: {amount:.2f} {currency} drawn from {bucket_label(state, bucket_id)}{dest} - "{description}" on {tx_date}.'
 
 
 def list_transactions(state, args):
@@ -294,31 +564,31 @@ def list_transactions(state, args):
     return header + "\n" + "\n".join(lines)
 
 
-def get_summary(state):
-    totals = {b["id"]: 0.0 for b in state["buckets"]}
+def confirm_pending(state, args):
+    any_confirmed = False
     for t in state["transactions"]:
-        if t.get("type") == "income" and t.get("split"):
-            for bid, amt in t["split"].items():
-                if bid in totals:
-                    totals[bid] += amt
-        elif t.get("type") == "expense" and t.get("bucketId") and t.get("affectsBucket", True):
-            if t["bucketId"] in totals:
-                totals[t["bucketId"]] -= t["amount"]
-        elif t.get("type") == "payout" and t.get("bucketId"):
-            if t["bucketId"] in totals:
-                totals[t["bucketId"]] -= t["amount"]
+        if t.get("type") == "income" and t.get("pending"):
+            t["pending"] = False
+            any_confirmed = True
+    if not any_confirmed:
+        return "Nothing pending."
+    return "All pending income confirmed."
 
+
+def get_summary(state):
+    derived = compute_derived(state)
     currency = state.get("currency", "")
-    lines = [
-        f'{b["name"]}: {round2(totals.get(b["id"], 0)):.2f} {currency}'
-        for b in state["buckets"]
-        if b.get("tier") != "secondary"
-    ]
-    return (
-        "Approximate balances (from raw splits - open the app for the exact live view, "
-        "which also accounts for cross-bucket borrowing when a bucket runs negative):\n"
-        + "\n".join(lines)
-    )
+    lines = []
+    for b in state["buckets"]:
+        if b.get("tier") == "secondary":
+            continue
+        confirmed = round2(derived["bucketConfirmed"].get(b["id"], 0))
+        pending = round2(derived["bucketPending"].get(b["id"], 0))
+        line = f'{b["name"]}: {confirmed:.2f} {currency}'
+        if pending:
+            line += f" (+{pending:.2f} pending)"
+        lines.append(line)
+    return "Current bucket balances (floor-and-cascade applied, same as the app):\n" + "\n".join(lines)
 
 
 # ---- MCP JSON-RPC plumbing ----------------------------------------------
@@ -338,6 +608,10 @@ TOOLS = [
                     "type": "string",
                     "description": 'Account name it landed in, e.g. "Main Account". Defaults to the app\'s default account.',
                 },
+                "pending": {
+                    "type": "boolean",
+                    "description": "Defaults to true, matching the app. Set false only if this money is already fully allocated/wired - true means it shows as pending until confirm_pending is called.",
+                },
             },
             "required": ["amount", "description"],
             "additionalProperties": False,
@@ -346,7 +620,11 @@ TOOLS = [
     {
         "name": "log_expense",
         "description": "Log a new expense transaction drawn from one Profit First bucket "
-        "(e.g. Opex, Profit, Tax, Owner's Pay - or any custom bucket name in this tracker).",
+        "(e.g. Opex, Profit, Tax, Owner's Pay - or any custom bucket name in this tracker). "
+        "For a normal real business expense, leave affects_bucket/affects_account at their "
+        "defaults (both true). Set affects_bucket false when real cash left an account but "
+        "the bucket's allocation should stay intact (e.g. a personal draw not counted as a "
+        "real business cost) - this is a judgment call, ask if unsure which applies.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -358,6 +636,34 @@ TOOLS = [
                     "type": "string",
                     "description": "Account it was paid from. Defaults to the app's default account.",
                 },
+                "affects_bucket": {
+                    "type": "boolean",
+                    "description": "Default true. False if this shouldn't reduce the bucket's virtual allocation.",
+                },
+                "affects_account": {
+                    "type": "boolean",
+                    "description": "Default true. False if this is a bucket-only reclassification with no real cash movement.",
+                },
+            },
+            "required": ["amount", "description", "bucket"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "log_payout",
+        "description": "Log a real draw/disbursement from a bucket that also moves actual money "
+        "between two real accounts - e.g. an Owner's Pay draw wired out to a personal account. "
+        "Different from log_expense: this represents genuine money movement between accounts, "
+        "not a business cost.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "amount": {"type": "number", "description": "Positive amount drawn"},
+                "description": {"type": "string", "description": "What this draw was for"},
+                "bucket": {"type": "string", "description": 'Which bucket this draw is against, by name (e.g. "Owner\'s Pay")'},
+                "date": {"type": "string", "description": "YYYY-MM-DD, defaults to today"},
+                "from_account": {"type": "string", "description": "Account the money left. Defaults to the app's default account."},
+                "to_account": {"type": "string", "description": "Account the money landed in, e.g. a personal account name."},
             },
             "required": ["amount", "description", "bucket"],
             "additionalProperties": False,
@@ -381,6 +687,11 @@ TOOLS = [
             },
             "additionalProperties": False,
         },
+    },
+    {
+        "name": "confirm_pending",
+        "description": "Confirm all pending income - moves every pending income split into each bucket's confirmed balance. Same as the app's \"Confirm all\" button. Use once Albaiti says a payment's split has actually been allocated or wired.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
 ]
 
@@ -425,10 +736,14 @@ def handle_mcp(body):
                 text = log_income(state, args)
             elif name == "log_expense":
                 text = log_expense(state, args)
+            elif name == "log_payout":
+                text = log_payout(state, args)
             elif name == "get_summary":
                 text = get_summary(state)
             elif name == "list_transactions":
                 text = list_transactions(state, args)
+            elif name == "confirm_pending":
+                text = confirm_pending(state, args)
             else:
                 raise ToolError(f"Unknown tool: {name}")
             write_state(state)
