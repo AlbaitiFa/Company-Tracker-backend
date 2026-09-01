@@ -2,6 +2,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>I Am Money — Company Tracker</title>
 <style>
+  /* Official Saudi Riyal sign (U+20C1, Unicode 17). Scoped to just that one
+     codepoint via unicode-range so it never affects any other character -
+     safe to sit first in every font stack below. Falls back to whatever
+     glyph the system font has for U+20C1 if this CDN is unreachable. */
+  @font-face {
+    font-family: "saudi-riyal";
+    src: url("https://cdn.jsdelivr.net/npm/@emran-alhaddad/saudi-riyal-font/fonts/regular/saudi_riyal.woff2") format("woff2"),
+         url("https://cdn.jsdelivr.net/npm/@emran-alhaddad/saudi-riyal-font/fonts/regular/saudi_riyal.woff") format("woff");
+    unicode-range: U+20C1;
+    font-display: swap;
+  }
   :root {
     --ink: #12181B;
     --paper: #F1F2EC;
@@ -23,8 +34,8 @@
     --focus: #1F5C4D;
 
     --font-display: "Iowan Old Style", "Palatino Linotype", "URW Palladio L", Georgia, serif;
-    --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    --font-body: "saudi-riyal", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --font-mono: "saudi-riyal", ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
 
     --content-max: 640px;
     color-scheme: light;
@@ -91,6 +102,7 @@
   button, input, select, textarea { font: inherit; color: inherit; }
   button { cursor: pointer; }
   .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .curr { font-size: 1.35em; line-height: 1; vertical-align: -0.06em; display: inline-block; }
 
   a { color: var(--accent); }
 
@@ -573,6 +585,12 @@
       return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
     });
   }
+  // Wraps the currency label in a bigger inline span - the new Saudi Riyal
+  // symbol renders noticeably smaller than surrounding digits at 1em. Only
+  // safe to use where the result lands in innerHTML (never in a plain-text
+  // tooltip string, a native title="" attribute, or an input's value="").
+  function curr() { return '<span class="curr">' + esc(state.currency) + '</span>'; }
+
   function accountTypeLabel(key) {
     var found = ACCOUNT_TYPES.filter(function (t) { return t.key === key; })[0];
     return found ? found.label : "Company";
@@ -582,7 +600,7 @@
     return {
       version: 2,
       business: "My Business",
-      currency: "SAR",
+      currency: "⃁",
       trackMaterials: false,
       companyDebt: 0,
       owners: [],
@@ -900,13 +918,13 @@
     var cardsHtml = companyAccounts.map(function (a) {
       var statusHtml = a.status ? '<span class="acct-status">' + esc(a.status) + '</span>' : "";
       return '<div class="stat"><div class="label">' + esc(a.name) + statusHtml + '</div>' +
-        '<div class="value num">' + fmt(derived.accountBalances[a.id]) + ' ' + esc(state.currency) + '</div></div>';
+        '<div class="value num">' + curr() + ' ' + fmt(derived.accountBalances[a.id]) + '</div></div>';
     }).join("");
     el.innerHTML = '<div class="stats-row-accounts">' + cardsHtml + '</div>' +
       '<div class="stat total"><div class="label">' +
         '<span class="total-label-full">Total across company accounts</span>' +
         '<span class="total-label-short">TOTAL <span class="total-note">— across company accounts</span></span>' +
-      '</div><div class="value num">' + fmt(total) + ' ' + esc(state.currency) + '</div></div>';
+      '</div><div class="value num">' + curr() + ' ' + fmt(total) + '</div></div>';
   }
 
   function monthLabel(monthStr) {
@@ -1015,7 +1033,7 @@
       var hasData = d.total > 0;
       var tipAttr = "";
       if (hasData) {
-        var tip = { label: monthLabel(d.period) + " " + targetYear, rows: [], total: fmt(d.total) + " " + state.currency };
+        var tip = { label: monthLabel(d.period) + " " + targetYear, rows: [], total: state.currency + " " + fmt(d.total) };
         tipAttr = " data-tip='" + esc(JSON.stringify(tip)) + "'";
       }
       return (
@@ -1029,7 +1047,7 @@
 
     el.innerHTML =
       '<div class="panel">' +
-        '<div class="comp-title">Yearly income <span class="sub">' + fmt(yearTotal) + ' ' + esc(state.currency) + ' total</span></div>' +
+        '<div class="comp-title">Yearly income <span class="sub">' + curr() + ' ' + fmt(yearTotal) + ' total</span></div>' +
         toggleHtml +
         navHtml +
         subToggleHtml +
@@ -1117,9 +1135,9 @@
       var tip = {
         label: monthLabel(d.period) + " " + targetYear,
         rows: [
-          { name: "Income", hue: "accent", amount: fmt(d.income) + " " + state.currency },
-          { name: "Expense", hue: "clay", amount: fmt(d.expense) + " " + state.currency },
-          { name: "Net", hue: "gold", amount: (d.net >= 0 ? "+" : "") + fmt(d.net) + " " + state.currency }
+          { name: "Income", hue: "accent", amount: state.currency + " " + fmt(d.income) },
+          { name: "Expense", hue: "clay", amount: state.currency + " " + fmt(d.expense) },
+          { name: "Net", hue: "gold", amount: state.currency + " " + (d.net >= 0 ? "+" : "") + fmt(d.net) }
         ]
       };
       var tipAttr = " data-tip='" + esc(JSON.stringify(tip)) + "'";
@@ -1164,7 +1182,7 @@
 
     el.innerHTML =
       '<div class="panel">' +
-        '<div class="comp-title">Yearly income vs expense <span class="sub">' + fmt(totalIncome) + ' in · ' + fmt(totalExpense) + ' out (' + esc(state.currency) + ')</span></div>' +
+        '<div class="comp-title">Yearly income vs expense <span class="sub">' + fmt(totalIncome) + ' in · ' + fmt(totalExpense) + ' out (' + curr() + ')</span></div>' +
         toggleHtml +
         navHtml +
         subToggleHtml +
@@ -1278,8 +1296,8 @@
       var hasData = dd.total > 0;
       var tipAttr = "";
       if (hasData) {
-        var rows = dd.txns.map(function (tx) { return { name: tx.desc, hue: "accent", amount: fmt(tx.amount) + " " + state.currency }; });
-        var tip = { label: monthLabel(targetMonth + "-01") + " " + dd.day, rows: rows, total: fmt(dd.total) + " " + state.currency };
+        var rows = dd.txns.map(function (tx) { return { name: tx.desc, hue: "accent", amount: state.currency + " " + fmt(tx.amount) }; });
+        var tip = { label: monthLabel(targetMonth + "-01") + " " + dd.day, rows: rows, total: state.currency + " " + fmt(dd.total) };
         tipAttr = " data-tip='" + esc(JSON.stringify(tip)) + "'";
       }
       return (
@@ -1293,7 +1311,7 @@
 
     el.innerHTML =
       '<div class="panel">' +
-        '<div class="comp-title">Monthly income <span class="sub">' + fmt(monthTotal) + ' ' + esc(state.currency) + ' · ' + entries.length + ' entr' + (entries.length === 1 ? "y" : "ies") + '</span></div>' +
+        '<div class="comp-title">Monthly income <span class="sub">' + curr() + ' ' + fmt(monthTotal) + ' · ' + entries.length + ' entr' + (entries.length === 1 ? "y" : "ies") + '</span></div>' +
         toggleHtml +
         navHtml +
         '<div class="mo-wrap">' +
@@ -1443,7 +1461,7 @@
         if (amt <= 0 || grand <= 0) return "";
         var pct = (amt / grand) * 100;
         var hue = bucketColor(i);
-        return '<div class="comp-seg" style="flex:' + pct + ' 0 0%; background:var(--' + hue + ')" title="' + esc(b.name) + ': ' + fmt(amt) + ' ' + esc(state.currency) + ' (' + pct.toFixed(1) + '%)"></div>';
+        return '<div class="comp-seg" style="flex:' + pct + ' 0 0%; background:var(--' + hue + ')" title="' + esc(b.name) + ': ' + esc(state.currency) + ' ' + fmt(amt) + ' (' + pct.toFixed(1) + '%)"></div>';
       }).join("");
     }
 
@@ -1463,9 +1481,9 @@
       '<div class="panel">' +
         '<div class="comp-title">Income split <span class="sub">' + esc(periodLabel) + '</span></div>' +
         toggleHtml + navHtml +
-        '<div style="font-size:0.72rem; font-weight:700; letter-spacing:0.02em; text-transform:uppercase; color:var(--text-muted); margin-bottom:4px">CAP (' + fmt(originalGrand) + ' ' + esc(state.currency) + ')</div>' +
+        '<div style="font-size:0.72rem; font-weight:700; letter-spacing:0.02em; text-transform:uppercase; color:var(--text-muted); margin-bottom:4px">CAP (' + curr() + ' ' + fmt(originalGrand) + ')</div>' +
         '<div class="comp-bar">' + buildBar(originalTotals, originalGrand) + '</div>' +
-        '<div style="font-size:0.72rem; font-weight:700; letter-spacing:0.02em; text-transform:uppercase; color:var(--text-muted); margin:12px 0 4px">Actual (' + fmt(actualGrand) + ' ' + esc(state.currency) + ')</div>' +
+        '<div style="font-size:0.72rem; font-weight:700; letter-spacing:0.02em; text-transform:uppercase; color:var(--text-muted); margin:12px 0 4px">Actual (' + curr() + ' ' + fmt(actualGrand) + ')</div>' +
         '<div class="comp-bar">' + buildBar(actualTotals, actualGrand) + '</div>' +
         '<div class="comp-legend" style="margin-top:12px">' + legendHtml + '</div>' +
       '</div>';
@@ -1681,7 +1699,7 @@
     el.innerHTML =
       '<div class="panel">' +
         '<div class="comp-title" style="margin-bottom:2px">Milestone pacing</div>' +
-        '<div class="bucket-caption">' + windowNote + ' · ' + stepsSoFar + ' step' + (stepsSoFar === 1 ? "" : "s") + ' applied this window · ' + fmt(remaining) + ' ' + esc(state.currency) + ' of Real Revenue until the next automatic step.</div>' +
+        '<div class="bucket-caption">' + windowNote + ' · ' + stepsSoFar + ' step' + (stepsSoFar === 1 ? "" : "s") + ' applied this window · ' + curr() + ' ' + fmt(remaining) + ' of Real Revenue until the next automatic step.</div>' +
       '</div>';
   }
 
@@ -2071,7 +2089,7 @@
       '<div class="ledger-item">' +
         '<div class="ledger-top">' +
           '<div><div class="ledger-desc">' + esc(tx.description || "(no description)") + '</div><div class="ledger-date">' + esc(tx.date) + '</div></div>' +
-          '<div class="ledger-amt num ' + amtClass + '">' + amtSign + fmt(tx.amount) + ' ' + esc(state.currency) + '</div>' +
+          '<div class="ledger-amt num ' + amtClass + '">' + curr() + ' ' + amtSign + fmt(tx.amount) + '</div>' +
         '</div>' +
         chips +
         '<div class="ledger-note">' + note + '</div>' +
@@ -3261,7 +3279,7 @@
     var materialsEl = sheet.querySelector("#aMaterials");
     var materials = materialsEl ? (parseFloat(materialsEl.value) || 0) : 0;
     var realRevenue = Math.max(0, round2(revenue - materials));
-    sheet.querySelector("#aRealRevenue").textContent = fmt(realRevenue) + " " + state.currency;
+    sheet.querySelector("#aRealRevenue").textContent = state.currency + " " + fmt(realRevenue);
 
     var primaryBuckets = assessPrimaryBuckets();
     var total = 0;
@@ -3282,7 +3300,7 @@
     }).join("");
     var accountedPct = realRevenue > 0 ? (total / realRevenue * 100) : 0;
     sheet.querySelector("#aPreview").innerHTML = rows +
-      '<div class="assess-row-preview total"><span>Accounted for (raw)</span><span class="num">' + fmt(total) + ' ' + esc(state.currency) + '  ·  ' + accountedPct.toFixed(1) + '%</span></div>' +
+      '<div class="assess-row-preview total"><span>Accounted for (raw)</span><span class="num">' + curr() + ' ' + fmt(total) + '  ·  ' + accountedPct.toFixed(1) + '%</span></div>' +
       '<div class="assess-row-preview total"><span>Adjusted CAP total</span><span class="num assess-adjusted">' + adjustedSum + '%</span></div>';
   }
 
@@ -3306,7 +3324,7 @@
     if (state.trackMaterials) {
       html += '<div class="field"><label>Materials / subcontractor cost</label><input class="input" type="number" step="0.01" min="0" id="aMaterials" placeholder="0.00"></div>';
     }
-    html += '<div class="bucket-caption" style="margin-bottom:14px">Real Revenue: <span class="num" id="aRealRevenue">0.00 ' + esc(state.currency) + '</span></div>';
+    html += '<div class="bucket-caption" style="margin-bottom:14px">Real Revenue: <span class="num" id="aRealRevenue">' + esc(state.currency) + ' 0.00</span></div>';
     html += '<div class="settings-section"><h4 id="aBucketHeader">Actual amount per bucket</h4>';
     html += primaryBuckets.map(function (b) {
       return '<div class="field"><label>' + esc(b.name) + '</label><input class="input" type="number" step="0.01" min="0" data-assess-bucket="' + b.id + '" placeholder="0.00"></div>';
@@ -3400,8 +3418,8 @@
 
     var lines = [];
     if (b.debtPaid > 0) {
-      lines.push('<div class="assess-row-preview"><span>To debt paydown</span><span class="num">' + fmt(b.debtPaid) + ' ' + esc(state.currency) + '</span></div>');
-      lines.push('<div class="assess-row-preview"><span>Debt remaining after</span><span class="num">' + fmt(round2(b.debt - b.debtPaid)) + ' ' + esc(state.currency) + '</span></div>');
+      lines.push('<div class="assess-row-preview"><span>To debt paydown</span><span class="num">' + curr() + ' ' + fmt(b.debtPaid) + '</span></div>');
+      lines.push('<div class="assess-row-preview"><span>Debt remaining after</span><span class="num">' + curr() + ' ' + fmt(round2(b.debt - b.debtPaid)) + '</span></div>');
     }
     if (b.ownerAmount > 0) {
       if (owners.length) {
@@ -3409,16 +3427,16 @@
         owners.forEach(function (o) {
           var acct = o.accountId ? accountById(o.accountId) : null;
           var share = round2(b.ownerAmount * (Number(o.pct) || 0) / ownerSum);
-          lines.push('<div class="assess-row-preview"><span>' + esc(o.name) + (acct ? ' → ' + esc(acct.name) : ' (no account set)') + '</span><span class="num">' + fmt(share) + ' ' + esc(state.currency) + '</span></div>');
+          lines.push('<div class="assess-row-preview"><span>' + esc(o.name) + (acct ? ' → ' + esc(acct.name) : ' (no account set)') + '</span><span class="num">' + curr() + ' ' + fmt(share) + '</span></div>');
         });
       } else {
         var acctEl = sheet.querySelector("#dAccount");
         var acct2 = acctEl ? accountById(acctEl.value) : null;
-        lines.push('<div class="assess-row-preview"><span>Owner bonus' + (acct2 ? ' → ' + esc(acct2.name) : '') + '</span><span class="num">' + fmt(b.ownerAmount) + ' ' + esc(state.currency) + '</span></div>');
+        lines.push('<div class="assess-row-preview"><span>Owner bonus' + (acct2 ? ' → ' + esc(acct2.name) : '') + '</span><span class="num">' + curr() + ' ' + fmt(b.ownerAmount) + '</span></div>');
       }
     }
     if (b.vaultAmount > 0) {
-      lines.push('<div class="assess-row-preview"><span>To Vault</span><span class="num">' + fmt(b.vaultAmount) + ' ' + esc(state.currency) + '</span></div>');
+      lines.push('<div class="assess-row-preview"><span>To Vault</span><span class="num">' + curr() + ' ' + fmt(b.vaultAmount) + '</span></div>');
     }
     if (!lines.length) lines.push('<div class="assess-row-preview"><span>Nothing to distribute right now.</span></div>');
     sheet.querySelector("#dPreview").innerHTML = lines.join("");
@@ -3439,9 +3457,9 @@
 
     var html = '<div class="sheet-head"><h3>Distribute Profit</h3><button class="icon-btn" id="distClose" aria-label="Close">' + xIcon() + '</button></div>';
     html += '<div class="ledger-note" style="margin-bottom:14px">' + (b.debt > 0
-      ? 'There\'s ' + fmt(b.debt) + ' ' + esc(state.currency) + ' of company debt on file — 100% of Profit\'s balance pays that down first. The 50/50 owner/Vault split resumes once it hits zero.'
+      ? 'There\'s ' + curr() + ' ' + fmt(b.debt) + ' of company debt on file — 100% of Profit\'s balance pays that down first. The 50/50 owner/Vault split resumes once it hits zero.'
       : (b.hasVault ? 'Distributes the full Profit balance: 50% to owners, 50% swept to Vault as reserve.' : 'Distributes the full Profit balance to owners (no Vault bucket found, so nothing is set aside).')) + '</div>';
-    html += '<div class="bucket-caption" style="margin-bottom:14px">Profit balance: <span class="num">' + fmt(b.profitBalance) + ' ' + esc(state.currency) + '</span> · Paying from: <strong>' + (fromAcct ? esc(fromAcct.name) : "—") + '</strong></div>';
+    html += '<div class="bucket-caption" style="margin-bottom:14px">Profit balance: <span class="num">' + curr() + ' ' + fmt(b.profitBalance) + '</span> · Paying from: <strong>' + (fromAcct ? esc(fromAcct.name) : "—") + '</strong></div>';
     html += '<div id="dBonusFieldWrap" class="field" style="' + (owners.length || b.ownerAmount <= 0 ? "display:none" : "") + '"><label>Owner bonus goes into (Personal accounts only)</label><select class="select" id="dAccount">' + personalAccountOptions() + '</select></div>';
     html += '<div class="assess-preview" id="dPreview"></div>';
     html += '<button class="btn btn-primary" id="distSubmit" style="margin-top:14px">Distribute</button>';
@@ -3487,7 +3505,7 @@
 
     if (!payouts.length) { showToast("Nothing to distribute."); return; }
 
-    var msg = "Distribute " + fmt(b.profitBalance) + " " + state.currency + " from Profit across " + payouts.length + " payout" + (payouts.length === 1 ? "" : "s") + "?";
+    var msg = "Distribute " + state.currency + " " + fmt(b.profitBalance) + " from Profit across " + payouts.length + " payout" + (payouts.length === 1 ? "" : "s") + "?";
 
     openConfirm(msg, "Distribute", false).then(function (ok) {
       if (!ok) return;
