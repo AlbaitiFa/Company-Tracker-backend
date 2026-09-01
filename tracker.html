@@ -513,6 +513,10 @@
   <div class="sheet" role="dialog" aria-modal="true" id="distributeSheet"></div>
 </div>
 
+<div class="overlay" id="obOverlay">
+  <div class="sheet" role="dialog" aria-modal="true" id="obSheet"></div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -1443,6 +1447,8 @@
       }).join("");
     }
 
+    function pctOf(amt, grand) { return grand > 0 ? (amt / grand) * 100 : 0; }
+
     var legendHtml = state.buckets.map(function (b, i) {
       var origAmt = originalTotals[b.id] || 0;
       var actAmt = actualTotals[b.id] || 0;
@@ -1450,16 +1456,16 @@
       var hue = bucketColor(i);
       return '<div class="comp-legend-item"><span class="comp-dot" style="background:var(--' + hue + ')"></span>' +
         '<span class="comp-legend-label">' + esc(b.name) + '</span>' +
-        '<span class="comp-legend-val num">split ' + fmt(origAmt) + ' · actual ' + fmt(actAmt) + '</span></div>';
+        '<span class="comp-legend-val num">CAP ' + pctOf(origAmt, originalGrand).toFixed(1) + '% · Actual ' + pctOf(actAmt, actualGrand).toFixed(1) + '%</span></div>';
     }).join("");
 
     el.innerHTML =
       '<div class="panel">' +
         '<div class="comp-title">Income split <span class="sub">' + esc(periodLabel) + '</span></div>' +
         toggleHtml + navHtml +
-        '<div style="font-size:0.72rem; font-weight:700; letter-spacing:0.02em; text-transform:uppercase; color:var(--text-muted); margin-bottom:4px">Originally split (' + fmt(originalGrand) + ' ' + esc(state.currency) + ')</div>' +
+        '<div style="font-size:0.72rem; font-weight:700; letter-spacing:0.02em; text-transform:uppercase; color:var(--text-muted); margin-bottom:4px">CAP (' + fmt(originalGrand) + ' ' + esc(state.currency) + ')</div>' +
         '<div class="comp-bar">' + buildBar(originalTotals, originalGrand) + '</div>' +
-        '<div style="font-size:0.72rem; font-weight:700; letter-spacing:0.02em; text-transform:uppercase; color:var(--text-muted); margin:12px 0 4px">Actually split (' + fmt(actualGrand) + ' ' + esc(state.currency) + ')</div>' +
+        '<div style="font-size:0.72rem; font-weight:700; letter-spacing:0.02em; text-transform:uppercase; color:var(--text-muted); margin:12px 0 4px">Actual (' + fmt(actualGrand) + ' ' + esc(state.currency) + ')</div>' +
         '<div class="comp-bar">' + buildBar(actualTotals, actualGrand) + '</div>' +
         '<div class="comp-legend" style="margin-top:12px">' + legendHtml + '</div>' +
       '</div>';
@@ -2970,7 +2976,7 @@
     '</div>';
     html += '</div>';
 
-    html += '<div class="settings-section"><h4>Accounts</h4><div class="ledger-note" style="margin-top:-6px">Use the arrows to reorder — this order sets the display order everywhere (dashboard, dropdowns).</div>';
+    html += '<div class="settings-section"><h4>Bank Accounts</h4><div class="ledger-note" style="margin-top:-6px">Use the arrows to reorder — this order sets the display order everywhere (dashboard, dropdowns).</div>';
     html += state.accounts.map(function (a, idx) {
       var type = a.type || "company";
       var isDefault = a.id === state.defaultAccountId || (!state.defaultAccountId && state.accounts[0] && state.accounts[0].id === a.id);
@@ -2990,19 +2996,9 @@
           }).join("") + '</select>' +
           '<input class="input" data-field="status" value="' + esc(a.status || "") + '" placeholder="Status badge (optional)">' +
         '</div>' +
-        '<div class="row2" style="margin-top:8px">' +
-          '<input class="input" type="number" step="0.01" min="0" data-ob-amount="' + a.id + '" placeholder="Opening balance amount">' +
-          '<select class="select" data-ob-bucket="' + a.id + '">' +
-            '<option value="__auto__">Split like income (CAP %)</option>' +
-            state.buckets.filter(function (b) { return b.tier !== "secondary"; }).map(function (b) {
-              return '<option value="' + b.id + '">' + esc(b.name) + ' only</option>';
-            }).join("") +
-          '</select>' +
-        '</div>' +
-        '<button class="btn" style="margin-top:6px; padding:6px 10px; font-size:0.8rem" data-set-opening-balance="' + a.id + '">Set opening balance</button>' +
       '</div>';
     }).join("");
-    html += '<button class="add-row-btn" id="addAccount">+ Add account</button></div>';
+    html += '<div class="btn-row"><button class="add-row-btn" id="addAccount">+ Add account</button><button class="btn" id="openObBtn">Add Opening Balance</button></div></div>';
 
     html += '<hr class="div">';
     html += '<div class="settings-section"><h4>Data</h4>' +
@@ -3210,40 +3206,8 @@
         moveAccount(btn.getAttribute("data-move-account"), btn.getAttribute("data-dir"));
       });
     });
-    sheet.querySelectorAll("[data-set-opening-balance]").forEach(function (btn) {
-      btn.addEventListener("click", function () {
-        var accountId = btn.getAttribute("data-set-opening-balance");
-        var row = btn.closest(".acct-edit-row");
-        var amountInput = row.querySelector("[data-ob-amount]");
-        var bucketSelect = row.querySelector("[data-ob-bucket]");
-        var amount = round2(parseFloat(amountInput.value));
-        if (!amount || amount <= 0) { showToast("Enter an opening balance amount greater than zero."); return; }
-        var choice = bucketSelect.value;
-        var allocation;
-        if (choice === "__auto__") {
-          var sum = capSum();
-          if (sum <= 0) { showToast("Set bucket CAP % in Settings first, or pick one specific bucket instead."); return; }
-          allocation = computeIncomeSplit(amount);
-        } else {
-          allocation = {};
-          allocation[choice] = amount;
-        }
-        var acct = accountById(accountId);
-        state.transactions.push({
-          id: uid(),
-          type: "opening_balance",
-          date: todayStr(),
-          description: "Opening balance — " + (acct ? acct.name : "account"),
-          amount: amount,
-          accountId: accountId,
-          allocation: allocation,
-          createdAt: Date.now(),
-          updatedAt: Date.now()
-        });
-        persist(); renderSettingsSheet(); render();
-        showToast("Opening balance added.");
-      });
-    });
+    var openObBtn = sheet.querySelector("#openObBtn");
+    if (openObBtn) openObBtn.addEventListener("click", function () { openObSheet(); });
     sheet.querySelector("#addAccount").addEventListener("click", function () {
       var newAccount = { id: uid(), name: "New account", status: "", type: "company" };
       var cashIdx = state.accounts.findIndex(function (a) { return a.id === CASH_ACCOUNT_ID; });
@@ -3537,6 +3501,76 @@
       render();
       showToast("Profit distributed.");
     });
+  }
+
+  function openObSheet() {
+    document.getElementById("obOverlay").classList.add("open");
+    renderObSheet();
+  }
+  function closeObSheet() { document.getElementById("obOverlay").classList.remove("open"); }
+
+  function renderObSheet() {
+    var sheet = document.getElementById("obSheet");
+    if (!state.accounts.length) {
+      sheet.innerHTML = '<div class="sheet-head"><h3>Add Opening Balance</h3><button class="icon-btn" id="obClose" aria-label="Close">' + xIcon() + '</button></div>' +
+        '<div class="empty-state">Add an account first (Settings → Accounts).</div>';
+      sheet.querySelector("#obClose").addEventListener("click", closeObSheet);
+      return;
+    }
+    var html = '<div class="sheet-head"><h3>Add Opening Balance</h3><button class="icon-btn" id="obClose" aria-label="Close">' + xIcon() + '</button></div>';
+    html += '<div class="ledger-note" style="margin-bottom:14px">Pre-existing cash an account already held before this tracker started.</div>';
+    html += '<div class="field"><label>Account</label><select class="select" id="obAccount">' +
+      state.accounts.map(function (a) { return '<option value="' + a.id + '">' + esc(a.name) + '</option>'; }).join("") +
+    '</select></div>';
+    html += '<div class="row2">' +
+      '<div class="field"><label>Date</label><input class="input" type="date" id="obDate" value="' + todayStr() + '"></div>' +
+      '<div class="field"><label>Amount</label><input class="input" type="number" step="0.01" min="0" id="obAmount" placeholder="0.00"></div>' +
+    '</div>';
+    html += '<div class="field"><label>Allocate to</label><select class="select" id="obBucket">' +
+      '<option value="__auto__">Split like income (CAP %)</option>' +
+      state.buckets.filter(function (b) { return b.tier !== "secondary"; }).map(function (b) {
+        return '<option value="' + b.id + '">' + esc(b.name) + ' only</option>';
+      }).join("") +
+    '</select></div>';
+    html += '<button class="btn btn-primary" id="obSubmit" style="margin-top:14px">Add opening balance</button>';
+    sheet.innerHTML = html;
+    sheet.querySelector("#obClose").addEventListener("click", closeObSheet);
+    sheet.querySelector("#obSubmit").addEventListener("click", handleObSubmit);
+  }
+
+  function handleObSubmit() {
+    var sheet = document.getElementById("obSheet");
+    var accountId = sheet.querySelector("#obAccount").value;
+    var date = sheet.querySelector("#obDate").value || todayStr();
+    var amount = round2(parseFloat(sheet.querySelector("#obAmount").value));
+    if (!amount || amount <= 0) { showToast("Enter an opening balance amount greater than zero."); return; }
+    var choice = sheet.querySelector("#obBucket").value;
+    var allocation;
+    if (choice === "__auto__") {
+      var sum = capSum();
+      if (sum <= 0) { showToast("Set bucket CAP % in Settings first, or pick one specific bucket instead."); return; }
+      allocation = computeIncomeSplit(amount);
+    } else {
+      allocation = {};
+      allocation[choice] = amount;
+    }
+    var acct = accountById(accountId);
+    state.transactions.push({
+      id: uid(),
+      type: "opening_balance",
+      date: date,
+      description: "Opening balance — " + (acct ? acct.name : "account"),
+      amount: amount,
+      accountId: accountId,
+      allocation: allocation,
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    });
+    persist();
+    closeObSheet();
+    renderSettingsSheet();
+    render();
+    showToast("Opening balance added.");
   }
 
   function slug(s) { return String(s || "profit-first").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "profit-first"; }
