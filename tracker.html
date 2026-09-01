@@ -1009,7 +1009,7 @@
     }
 
     if (yearTotal <= 0) {
-      el.innerHTML = '<div class="panel">' + toggleHtml + navHtml + subToggleHtml + '<div class="empty-state" style="margin-top:12px">No income logged in ' + esc(targetYear) + '.</div></div>';
+      el.innerHTML = '<div class="panel">' + '<div class="comp-title">Income</div>' + toggleHtml + navHtml + subToggleHtml + '<div class="empty-state" style="margin-top:12px">No income logged in ' + esc(targetYear) + '.</div></div>';
       wireIncomeChartToggle(el);
       wireIncomeYearNav(el);
       wireIncomeYearlySubToggle(el);
@@ -1048,7 +1048,7 @@
 
     el.innerHTML =
       '<div class="panel">' +
-        '<div class="comp-title">Yearly income <span class="sub">' + curr() + ' ' + fmt(yearTotal) + ' total</span></div>' +
+        '<div class="comp-title">Income <span class="sub">' + curr() + ' ' + fmt(yearTotal) + ' total</span></div>' +
         toggleHtml +
         navHtml +
         subToggleHtml +
@@ -1257,7 +1257,7 @@
       '</div>';
 
     if (!entries.length) {
-      el.innerHTML = '<div class="panel">' + toggleHtml + navHtml + '<div class="empty-state" style="margin-top:12px">No income logged in ' + esc(monthYearLabel(targetMonth)) + '.</div></div>';
+      el.innerHTML = '<div class="panel">' + '<div class="comp-title">Income</div>' + toggleHtml + navHtml + '<div class="empty-state" style="margin-top:12px">No income logged in ' + esc(monthYearLabel(targetMonth)) + '.</div></div>';
       wireIncomeChartToggle(el);
       wireIncomeMonthNav(el);
       return;
@@ -1312,7 +1312,7 @@
 
     el.innerHTML =
       '<div class="panel">' +
-        '<div class="comp-title">Monthly income <span class="sub">' + curr() + ' ' + fmt(monthTotal) + ' · ' + entries.length + ' entr' + (entries.length === 1 ? "y" : "ies") + '</span></div>' +
+        '<div class="comp-title">Income <span class="sub">' + curr() + ' ' + fmt(monthTotal) + ' · ' + entries.length + ' entr' + (entries.length === 1 ? "y" : "ies") + '</span></div>' +
         toggleHtml +
         navHtml +
         '<div class="mo-wrap">' +
@@ -1451,7 +1451,7 @@
     var actualGrand = state.buckets.reduce(function (s, b) { return s + (actualTotals[b.id] || 0); }, 0);
 
     if (originalGrand <= 0 && actualGrand <= 0) {
-      el.innerHTML = '<div class="panel">' + toggleHtml + navHtml + '<div class="empty-state" style="margin-top:12px">Nothing logged in ' + esc(periodLabel) + '.</div></div>';
+      el.innerHTML = '<div class="panel">' + '<div class="comp-title">Allocation <span class="sub">' + esc(periodLabel) + '</span></div>' + toggleHtml + navHtml + '<div class="empty-state" style="margin-top:12px">Nothing logged in ' + esc(periodLabel) + '.</div></div>';
       wireCompositionNav(el);
       return;
     }
@@ -1480,7 +1480,7 @@
 
     el.innerHTML =
       '<div class="panel">' +
-        '<div class="comp-title">Income split <span class="sub">' + esc(periodLabel) + '</span></div>' +
+        '<div class="comp-title">Allocation <span class="sub">' + esc(periodLabel) + '</span></div>' +
         toggleHtml + navHtml +
         '<div style="font-size:0.72rem; font-weight:700; letter-spacing:0.02em; text-transform:uppercase; color:var(--text-muted); margin-bottom:4px">CAP (' + curr() + ' ' + fmt(originalGrand) + ')</div>' +
         '<div class="comp-bar">' + buildBar(originalTotals, originalGrand) + '</div>' +
