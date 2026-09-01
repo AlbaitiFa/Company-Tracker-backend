@@ -762,6 +762,11 @@
     var floorPriority = ["opex", "profit", "tax", "ownerspay"];
     state.buckets.forEach(function (b) { if (floorPriority.indexOf(b.id) === -1 && b.tier === "secondary") floorPriority.push(b.id); });
     var txFloorNotes = {};
+    // Raw cascade data per transaction that triggered a floor draw - same
+    // events as txFloorNotes but as numbers instead of display text, so
+    // renderComposition() can attribute "actually split" deviation to the
+    // buckets involved (see below).
+    var txCascade = {};
 
     function drawFromBucket(bucketId, amount) {
       if (!bucketConfirmed.hasOwnProperty(bucketId)) return null;
@@ -812,7 +817,10 @@
         if (tx.affectsAccount && !tx.historical && accountBalances.hasOwnProperty(tx.accountId)) accountBalances[tx.accountId] -= tx.amount;
         if (tx.affectsBucket && bucketConfirmed.hasOwnProperty(tx.bucketId)) {
           var r1 = drawFromBucket(tx.bucketId, tx.amount);
-          if (r1) txFloorNotes[tx.id] = floorNoteText(tx.bucketId, r1);
+          if (r1) {
+            txFloorNotes[tx.id] = floorNoteText(tx.bucketId, r1);
+            txCascade[tx.id] = { bucketId: tx.bucketId, shortfall: r1.shortfall, coveredBy: r1.coveredBy };
+          }
         }
       } else if (tx.type === "transfer") {
         if (!tx.historical && accountBalances.hasOwnProperty(tx.accountId)) accountBalances[tx.accountId] -= tx.amount;
@@ -820,7 +828,10 @@
       } else if (tx.type === "payout") {
         if (bucketConfirmed.hasOwnProperty(tx.bucketId)) {
           var r2 = drawFromBucket(tx.bucketId, tx.amount);
-          if (r2) txFloorNotes[tx.id] = floorNoteText(tx.bucketId, r2);
+          if (r2) {
+            txFloorNotes[tx.id] = floorNoteText(tx.bucketId, r2);
+            txCascade[tx.id] = { bucketId: tx.bucketId, shortfall: r2.shortfall, coveredBy: r2.coveredBy };
+          }
         }
         if (tx.toBucketId && bucketConfirmed.hasOwnProperty(tx.toBucketId)) bucketConfirmed[tx.toBucketId] += tx.amount;
         if (!tx.historical && tx.toAccountId && accountBalances.hasOwnProperty(tx.toAccountId)) accountBalances[tx.toAccountId] += tx.amount;
@@ -841,7 +852,7 @@
       }
     });
 
-    return { bucketConfirmed: bucketConfirmed, bucketPending: bucketPending, accountBalances: accountBalances, txFloorNotes: txFloorNotes };
+    return { bucketConfirmed: bucketConfirmed, bucketPending: bucketPending, accountBalances: accountBalances, txFloorNotes: txFloorNotes, txCascade: txCascade };
   }
 
   function capSum() { return round2(state.buckets.filter(function (b) { return b.tier !== "secondary"; }).reduce(function (s, b) { return s + (Number(b.cap) || 0); }, 0)); }
@@ -1351,13 +1362,17 @@
   //  - "Originally split": each income transaction's own split amounts,
   //    for income dated within the period (excludes opening_balance - it
   //    isn't income).
-  //  - "Actually split": the sum of every expense/payout tagged to that
-  //    bucket within the period, full stop - a category total, showing how
-  //    the split that actually happened deviated from the one CAP% intended.
-  //    Deliberately does NOT reassign amounts across buckets when one
-  //    bucket's balance was too low and another had to cover the shortfall
-  //    (see the floor/cascade notes on individual ledger items for that);
-  //    doing so here double-counted the same dollar under two buckets.
+  //  - "Actually split": originally split, adjusted for any floor/cascade
+  //    event (see drawFromBucket()/txCascade in computeDerived()) triggered
+  //    by a transaction dated within the period. If a bucket's own expense
+  //    exceeds its balance, the shortfall is pulled from other buckets in
+  //    floorPriority order - that bucket's "actual" goes UP by the full
+  //    shortfall (it really consumed that much), and each bucket that
+  //    covered part of it goes DOWN by the amount it gave up. A bucket with
+  //    no cascade involvement nets to exactly its allocation - zero
+  //    deviation. This is deliberately NOT a period-start/period-end
+  //    confirmed-balance diff - that approach was tried and rejected
+  //    because ordinary spend-down (not deviation) polluted the numbers.
   function renderComposition() {
     var el = document.getElementById("compositionSection");
 
@@ -1396,12 +1411,19 @@
     });
     var originalGrand = state.buckets.reduce(function (s, b) { return s + (originalTotals[b.id] || 0); }, 0);
 
+    var txCascade = (lastDerived && lastDerived.txCascade) || {};
     var actualTotals = {};
-    state.buckets.forEach(function (b) { actualTotals[b.id] = 0; });
+    state.buckets.forEach(function (b) { actualTotals[b.id] = originalTotals[b.id] || 0; });
     state.transactions.forEach(function (t) {
-      if ((t.type === "expense" || t.type === "payout") && t.bucketId && periodMatch(t.date)) {
-        if (actualTotals.hasOwnProperty(t.bucketId)) actualTotals[t.bucketId] += t.amount;
+      if (!periodMatch(t.date)) return;
+      var cascade = txCascade[t.id];
+      if (!cascade) return;
+      if (actualTotals.hasOwnProperty(cascade.bucketId)) {
+        actualTotals[cascade.bucketId] = round2(actualTotals[cascade.bucketId] + cascade.shortfall);
       }
+      cascade.coveredBy.forEach(function (c) {
+        if (actualTotals.hasOwnProperty(c.id)) actualTotals[c.id] = round2(actualTotals[c.id] - c.amount);
+      });
     });
     var actualGrand = state.buckets.reduce(function (s, b) { return s + (actualTotals[b.id] || 0); }, 0);
 
