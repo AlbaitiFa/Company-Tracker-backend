@@ -358,6 +358,17 @@ def compute_derived(state):
                     account_balances[tx["toAccountId"]] += tx["amount"]
                 if tx.get("fromAccountId") and tx["fromAccountId"] in account_balances:
                     account_balances[tx["fromAccountId"]] -= tx["amount"]
+        elif ttype == "opening_balance":
+            # Mirrors tracker.html's computeDerived() opening_balance branch -
+            # pre-existing cash, not income: never counted here as revenue
+            # (monthly_real_revenue only sums type "income"), just an
+            # account-balance seed that lands directly in the bucket(s) it's
+            # assigned to.
+            if tx.get("accountId") in account_balances:
+                account_balances[tx["accountId"]] += tx["amount"]
+            for bid, amt in (tx.get("allocation") or {}).items():
+                if bid in bucket_confirmed:
+                    bucket_confirmed[bid] += amt
 
     return {
         "bucketConfirmed": bucket_confirmed,

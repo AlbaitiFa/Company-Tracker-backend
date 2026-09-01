@@ -525,8 +525,8 @@
   // Point this at your deployed server.js so transactions logged via Claude
   // chat (through the /mcp custom connector) show up here too. Leave
   // SYNC_URL empty to keep this exactly as it was - localStorage only.
-  var SYNC_URL = "https://company-tracker-backend.onrender.com"; // e.g. "https://your-tracker-server.example.com"
-  var SYNC_TOKEN = "7e8a429444523fdbd1856470cac5e1a0dcd7bbfc05af0e803560d2fe3cc50b00"; // must match SYNC_TOKEN on the server - keep this file private once set
+  var SYNC_URL = "https://company-tracker-backend.onrender.com";
+  var SYNC_TOKEN = "7e8a429444523fdbd1856470cac5e1a0dcd7bbfc05af0e803560d2fe3cc50b00";
 
   var HUES = ["accent", "gold", "clay", "slate", "plum", "moss"];
   var CASH_ACCOUNT_ID = "cash";
@@ -825,6 +825,19 @@
         if (tx.toBucketId && bucketConfirmed.hasOwnProperty(tx.toBucketId)) bucketConfirmed[tx.toBucketId] += tx.amount;
         if (!tx.historical && tx.toAccountId && accountBalances.hasOwnProperty(tx.toAccountId)) accountBalances[tx.toAccountId] += tx.amount;
         if (!tx.historical && tx.fromAccountId && accountBalances.hasOwnProperty(tx.fromAccountId)) accountBalances[tx.fromAccountId] -= tx.amount;
+      } else if (tx.type === "opening_balance") {
+        // Pre-existing cash a bank account already had before this tracker
+        // started - establishes the account's real starting balance and
+        // lands directly in whichever bucket(s) it's assigned to, but it is
+        // NOT income: monthlyRealRevenue() only sums type "income", so this
+        // never counts toward Real Revenue or CAP milestone stepping, and
+        // renderComposition()'s "Originally split" bar only sums type
+        // "income" too, so it's excluded there as well - on purpose, since
+        // it isn't revenue that was split, it's cash that already existed.
+        if (accountBalances.hasOwnProperty(tx.accountId)) accountBalances[tx.accountId] += tx.amount;
+        Object.keys(tx.allocation || {}).forEach(function (bid) {
+          if (bucketConfirmed.hasOwnProperty(bid)) bucketConfirmed[bid] += tx.allocation[bid];
+        });
       }
     });
 
@@ -835,7 +848,7 @@
   function tapSum() { return round2(state.buckets.filter(function (b) { return b.tier !== "secondary"; }).reduce(function (s, b) { return s + (Number(b.tap) || 0); }, 0)); }
 
   function bucketUsedInTx(id) {
-    return state.transactions.some(function (t) { return t.bucketId === id || t.toBucketId === id || (t.split && t.split.hasOwnProperty(id)); });
+    return state.transactions.some(function (t) { return t.bucketId === id || t.toBucketId === id || (t.split && t.split.hasOwnProperty(id)) || (t.allocation && t.allocation.hasOwnProperty(id)); });
   }
   function accountUsedInTx(id) {
     return state.transactions.some(function (t) { return t.accountId === id || t.toAccountId === id || t.fromAccountId === id; });
@@ -879,19 +892,6 @@
         '<span class="total-label-full">Total across company accounts</span>' +
         '<span class="total-label-short">TOTAL <span class="total-note">— across company accounts</span></span>' +
       '</div><div class="value num">' + fmt(total) + ' ' + esc(state.currency) + '</div></div>';
-  }
-
-  function lifetimeBucketSplit() {
-    var totals = {};
-    state.buckets.forEach(function (b) { totals[b.id] = 0; });
-    state.transactions.forEach(function (t) {
-      if (t.type === "income" && t.split) {
-        Object.keys(t.split).forEach(function (bid) {
-          if (totals.hasOwnProperty(bid)) totals[bid] += t.split[bid];
-        });
-      }
-    });
-    return totals;
   }
 
   function monthLabel(monthStr) {
@@ -941,7 +941,7 @@
 
 
   function renderIncomeChartYearly(el, toggleHtml) {
-    var targetYear = String(Number(mostRecentIncomeYear()) + incomeChartYearOffset);
+    var targetYear = String(Number(todayStr().slice(0, 4)) + incomeChartYearOffset);
     var byMonth = {};
     state.transactions.forEach(function (t) {
       if (t.type !== "income" || (t.date || "").slice(0, 4) !== targetYear) return;
@@ -1208,7 +1208,10 @@
   }
 
   function renderIncomeChartMonthly(el, toggleHtml) {
-    var targetMonth = addMonths(mostRecentIncomeMonth(), incomeChartMonthOffset);
+    // Anchor on today's real month, same convention the milestone pacing
+    // card uses - not the most recent month with income in it, which used
+    // to leave this stuck on August into September with nothing logged yet.
+    var targetMonth = addMonths(todayStr().slice(0, 7), incomeChartMonthOffset);
     var entries = state.transactions.filter(function (t) { return t.type === "income" && (t.date || "").slice(0, 7) === targetMonth; })
       .slice().sort(function (a, b) { return a.date === b.date ? (a.createdAt || 0) - (b.createdAt || 0) : (a.date < b.date ? -1 : 1); });
 
@@ -1340,38 +1343,124 @@
     });
   }
 
+  var compositionView = "monthly"; // "monthly" or "yearly" - mirrors the income chart's own toggle
+  var compositionMonthOffset = 0;
+  var compositionYearOffset = 0;
+
+  // Both bars are scoped to the SAME period, so they're actually comparable:
+  //  - "Originally split": each income transaction's own split amounts,
+  //    for income dated within the period (excludes opening_balance - it
+  //    isn't income).
+  //  - "Actually split": the sum of every expense/payout tagged to that
+  //    bucket within the period, full stop - a category total, showing how
+  //    the split that actually happened deviated from the one CAP% intended.
+  //    Deliberately does NOT reassign amounts across buckets when one
+  //    bucket's balance was too low and another had to cover the shortfall
+  //    (see the floor/cascade notes on individual ledger items for that);
+  //    doing so here double-counted the same dollar under two buckets.
   function renderComposition() {
     var el = document.getElementById("compositionSection");
-    var totals = lifetimeBucketSplit();
-    var grand = state.buckets.reduce(function (s, b) { return s + (totals[b.id] || 0); }, 0);
 
-    if (grand <= 0) {
-      el.innerHTML = '<div class="empty-state">Log some income to see how it splits across buckets.</div>';
+    var toggleHtml =
+      '<div class="segmented" style="max-width:180px">' +
+        '<button data-comp-view="monthly" class="' + (compositionView === "monthly" ? "active" : "") + '">Monthly</button>' +
+        '<button data-comp-view="yearly" class="' + (compositionView === "yearly" ? "active" : "") + '">Yearly</button>' +
+      '</div>';
+
+    var periodLabel, periodMatch;
+    if (compositionView === "yearly") {
+      var targetYear = String(Number(todayStr().slice(0, 4)) + compositionYearOffset);
+      periodLabel = targetYear;
+      periodMatch = function (d) { return (d || "").slice(0, 4) === targetYear; };
+    } else {
+      var targetMonth = addMonths(todayStr().slice(0, 7), compositionMonthOffset);
+      periodLabel = monthYearLabel(targetMonth);
+      periodMatch = function (d) { return (d || "").slice(0, 7) === targetMonth; };
+    }
+
+    var navHtml =
+      '<div class="income-chart-nav">' +
+        '<button type="button" class="icon-btn" id="compPrev" aria-label="Previous">' + backIcon() + '</button>' +
+        '<div class="income-chart-nav-label">' + esc(periodLabel) + '</div>' +
+        '<button type="button" class="icon-btn" id="compNext" aria-label="Next" style="transform:rotate(180deg)">' + backIcon() + '</button>' +
+      '</div>';
+
+    var originalTotals = {};
+    state.buckets.forEach(function (b) { originalTotals[b.id] = 0; });
+    state.transactions.forEach(function (t) {
+      if (t.type === "income" && t.split && periodMatch(t.date)) {
+        Object.keys(t.split).forEach(function (bid) {
+          if (originalTotals.hasOwnProperty(bid)) originalTotals[bid] += t.split[bid];
+        });
+      }
+    });
+    var originalGrand = state.buckets.reduce(function (s, b) { return s + (originalTotals[b.id] || 0); }, 0);
+
+    var actualTotals = {};
+    state.buckets.forEach(function (b) { actualTotals[b.id] = 0; });
+    state.transactions.forEach(function (t) {
+      if ((t.type === "expense" || t.type === "payout") && t.bucketId && periodMatch(t.date)) {
+        if (actualTotals.hasOwnProperty(t.bucketId)) actualTotals[t.bucketId] += t.amount;
+      }
+    });
+    var actualGrand = state.buckets.reduce(function (s, b) { return s + (actualTotals[b.id] || 0); }, 0);
+
+    if (originalGrand <= 0 && actualGrand <= 0) {
+      el.innerHTML = '<div class="panel">' + toggleHtml + navHtml + '<div class="empty-state" style="margin-top:12px">Nothing logged in ' + esc(periodLabel) + '.</div></div>';
+      wireCompositionNav(el);
       return;
     }
 
-    var barHtml = state.buckets.map(function (b, i) {
-      var amt = totals[b.id] || 0;
-      if (amt <= 0) return "";
-      var pct = (amt / grand) * 100;
-      var hue = bucketColor(i);
-      return '<div class="comp-seg" style="flex:' + pct + ' 0 0%; background:var(--' + hue + ')" title="' + esc(b.name) + ': ' + fmt(amt) + ' ' + esc(state.currency) + ' (' + pct.toFixed(1) + '%)"></div>';
-    }).join("");
+    function buildBar(totals, grand) {
+      return state.buckets.map(function (b, i) {
+        var amt = totals[b.id] || 0;
+        if (amt <= 0 || grand <= 0) return "";
+        var pct = (amt / grand) * 100;
+        var hue = bucketColor(i);
+        return '<div class="comp-seg" style="flex:' + pct + ' 0 0%; background:var(--' + hue + ')" title="' + esc(b.name) + ': ' + fmt(amt) + ' ' + esc(state.currency) + ' (' + pct.toFixed(1) + '%)"></div>';
+      }).join("");
+    }
 
     var legendHtml = state.buckets.map(function (b, i) {
-      var amt = totals[b.id] || 0;
-      if (amt <= 0) return "";
-      var pct = (amt / grand) * 100;
+      var origAmt = originalTotals[b.id] || 0;
+      var actAmt = actualTotals[b.id] || 0;
+      if (origAmt <= 0 && actAmt <= 0) return "";
       var hue = bucketColor(i);
-      return '<div class="comp-legend-item"><span class="comp-dot" style="background:var(--' + hue + ')"></span><span class="comp-legend-label">' + esc(b.name) + '</span><span class="comp-legend-val num">' + fmt(amt) + ' ' + esc(state.currency) + ' · ' + pct.toFixed(1) + '%</span></div>';
+      return '<div class="comp-legend-item"><span class="comp-dot" style="background:var(--' + hue + ')"></span>' +
+        '<span class="comp-legend-label">' + esc(b.name) + '</span>' +
+        '<span class="comp-legend-val num">split ' + fmt(origAmt) + ' · actual ' + fmt(actAmt) + '</span></div>';
     }).join("");
 
     el.innerHTML =
       '<div class="panel">' +
-        '<div class="comp-title">Income split so far <span class="sub">' + fmt(grand) + ' ' + esc(state.currency) + ' total, all-time</span></div>' +
-        '<div class="comp-bar">' + barHtml + '</div>' +
-        '<div class="comp-legend">' + legendHtml + '</div>' +
+        '<div class="comp-title">Income split <span class="sub">' + esc(periodLabel) + '</span></div>' +
+        toggleHtml + navHtml +
+        '<div style="font-size:0.72rem; font-weight:700; letter-spacing:0.02em; text-transform:uppercase; color:var(--text-muted); margin-bottom:4px">Originally split (' + fmt(originalGrand) + ' ' + esc(state.currency) + ')</div>' +
+        '<div class="comp-bar">' + buildBar(originalTotals, originalGrand) + '</div>' +
+        '<div style="font-size:0.72rem; font-weight:700; letter-spacing:0.02em; text-transform:uppercase; color:var(--text-muted); margin:12px 0 4px">Actually split (' + fmt(actualGrand) + ' ' + esc(state.currency) + ')</div>' +
+        '<div class="comp-bar">' + buildBar(actualTotals, actualGrand) + '</div>' +
+        '<div class="comp-legend" style="margin-top:12px">' + legendHtml + '</div>' +
       '</div>';
+    wireCompositionNav(el);
+  }
+
+  function wireCompositionNav(el) {
+    el.querySelectorAll("[data-comp-view]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        compositionView = btn.getAttribute("data-comp-view");
+        renderComposition();
+      });
+    });
+    var prevBtn = el.querySelector("#compPrev");
+    var nextBtn = el.querySelector("#compNext");
+    if (prevBtn) prevBtn.addEventListener("click", function () {
+      if (compositionView === "yearly") compositionYearOffset -= 1; else compositionMonthOffset -= 1;
+      renderComposition();
+    });
+    if (nextBtn) nextBtn.addEventListener("click", function () {
+      if (compositionView === "yearly") compositionYearOffset += 1; else compositionMonthOffset += 1;
+      renderComposition();
+    });
   }
 
   function latestIncomeNote() {
@@ -1802,6 +1891,7 @@
               '<option value="expense"' + (f.type === "expense" ? " selected" : "") + '>Expense</option>' +
               '<option value="payout"' + (f.type === "payout" ? " selected" : "") + '>Payout / Move</option>' +
               '<option value="transfer"' + (f.type === "transfer" ? " selected" : "") + '>Transfer</option>' +
+              '<option value="opening_balance"' + (f.type === "opening_balance" ? " selected" : "") + '>Opening balance</option>' +
             '</select></div>' +
             '<div class="field"><label>Bucket</label><select class="select" id="ledgerBucketFilter">' +
               '<option value="">All buckets</option>' +
@@ -1882,8 +1972,9 @@
 
   function renderLedgerItem(tx) {
     var isOut = tx.type === "expense" || tx.type === "payout";
-    var amtClass = tx.type === "income" ? "pos" : (isOut ? "neg" : "");
-    var amtSign = tx.type === "income" ? "+" : (isOut ? "−" : "");
+    var isIn = tx.type === "income" || tx.type === "opening_balance";
+    var amtClass = isIn ? "pos" : (isOut ? "neg" : "");
+    var amtSign = isIn ? "+" : (isOut ? "−" : "");
     var chips = "", note = "";
 
     var recurringBadge = tx.recurring && tx.recurring.active ? '<span class="chip recurring-badge">↻ ' + esc(tx.recurring.frequency) + '</span>'
@@ -1930,9 +2021,17 @@
       }
       var destText = toBucket ? ("into " + esc(toBucket.name) + " bucket" + (toAcct ? " (" + esc(toAcct.name) + ")" : "")) : (toAcct ? "into " + esc(toAcct.name) : "paid out, not tracked further");
       note = "Out of " + (bP ? esc(bP.name) : "(deleted bucket)") + (fromAcct ? " (" + esc(fromAcct.name) + ")" : "") + " → " + destText;
+    } else if (tx.type === "opening_balance") {
+      var acct3 = accountById(tx.accountId);
+      chips = '<div class="chip-row">' + Object.keys(tx.allocation || {}).map(function (bid) {
+        var b3 = bucketById(bid); if (!b3) return "";
+        var hue3 = bucketColor(bucketIndex(bid));
+        return '<span class="chip" style="--chip-soft:var(--' + hue3 + '-soft);--chip-color:var(--' + hue3 + ')">' + esc(b3.name) + ' ' + fmt(tx.allocation[bid]) + '</span>';
+      }).join("") + '</div>';
+      note = "Into " + (acct3 ? esc(acct3.name) : "(deleted account)") + " · not counted as Real Revenue";
     }
 
-    var actions = '<button class="link-btn" data-action="edit" data-id="' + tx.id + '">Edit</button>';
+    var actions = tx.type === "opening_balance" ? "" : '<button class="link-btn" data-action="edit" data-id="' + tx.id + '">Edit</button>';
     if (tx.type === "income" && tx.pending) {
       actions += '<button class="link-btn" data-action="confirm" data-id="' + tx.id + '">Confirm</button>';
     }
@@ -2869,6 +2968,16 @@
           }).join("") + '</select>' +
           '<input class="input" data-field="status" value="' + esc(a.status || "") + '" placeholder="Status badge (optional)">' +
         '</div>' +
+        '<div class="row2" style="margin-top:8px">' +
+          '<input class="input" type="number" step="0.01" min="0" data-ob-amount="' + a.id + '" placeholder="Opening balance amount">' +
+          '<select class="select" data-ob-bucket="' + a.id + '">' +
+            '<option value="__auto__">Split like income (CAP %)</option>' +
+            state.buckets.filter(function (b) { return b.tier !== "secondary"; }).map(function (b) {
+              return '<option value="' + b.id + '">' + esc(b.name) + ' only</option>';
+            }).join("") +
+          '</select>' +
+        '</div>' +
+        '<button class="btn" style="margin-top:6px; padding:6px 10px; font-size:0.8rem" data-set-opening-balance="' + a.id + '">Set opening balance</button>' +
       '</div>';
     }).join("");
     html += '<button class="add-row-btn" id="addAccount">+ Add account</button></div>';
@@ -3077,6 +3186,40 @@
     sheet.querySelectorAll("[data-move-account]").forEach(function (btn) {
       btn.addEventListener("click", function () {
         moveAccount(btn.getAttribute("data-move-account"), btn.getAttribute("data-dir"));
+      });
+    });
+    sheet.querySelectorAll("[data-set-opening-balance]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var accountId = btn.getAttribute("data-set-opening-balance");
+        var row = btn.closest(".acct-edit-row");
+        var amountInput = row.querySelector("[data-ob-amount]");
+        var bucketSelect = row.querySelector("[data-ob-bucket]");
+        var amount = round2(parseFloat(amountInput.value));
+        if (!amount || amount <= 0) { showToast("Enter an opening balance amount greater than zero."); return; }
+        var choice = bucketSelect.value;
+        var allocation;
+        if (choice === "__auto__") {
+          var sum = capSum();
+          if (sum <= 0) { showToast("Set bucket CAP % in Settings first, or pick one specific bucket instead."); return; }
+          allocation = computeIncomeSplit(amount);
+        } else {
+          allocation = {};
+          allocation[choice] = amount;
+        }
+        var acct = accountById(accountId);
+        state.transactions.push({
+          id: uid(),
+          type: "opening_balance",
+          date: todayStr(),
+          description: "Opening balance — " + (acct ? acct.name : "account"),
+          amount: amount,
+          accountId: accountId,
+          allocation: allocation,
+          createdAt: Date.now(),
+          updatedAt: Date.now()
+        });
+        persist(); renderSettingsSheet(); render();
+        showToast("Opening balance added.");
       });
     });
     sheet.querySelector("#addAccount").addEventListener("click", function () {
