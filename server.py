@@ -793,9 +793,11 @@ def list_transactions(state, args):
 
 def confirm_pending(state, args):
     any_confirmed = False
+    now = int(time.time() * 1000)
     for t in state["transactions"]:
         if t.get("type") == "income" and t.get("pending"):
             t["pending"] = False
+            t["updatedAt"] = now
             any_confirmed = True
     if not any_confirmed:
         return "Nothing pending."

@@ -2820,7 +2820,8 @@
 
   function confirmAllPending() {
     var any = false;
-    state.transactions.forEach(function (t) { if (t.type === "income" && t.pending) { t.pending = false; any = true; } });
+    var now = Date.now();
+    state.transactions.forEach(function (t) { if (t.type === "income" && t.pending) { t.pending = false; t.updatedAt = now; any = true; } });
     if (!any) { showToast("Nothing pending."); return; }
     persist(); render();
     showToast("All pending income confirmed.");
@@ -2845,6 +2846,7 @@
 
     if (action === "confirm") {
       tx.pending = false;
+      tx.updatedAt = Date.now();
       persist(); render();
       showToast("Marked confirmed.");
     } else if (action === "delete") {
