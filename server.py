@@ -713,6 +713,8 @@ def list_transactions(state, args):
         return "No transactions match."
 
     currency = state.get("currency", "")
+    derived = compute_derived(state)
+    tx_floor_notes = derived["txFloorNotes"]
 
     def account_name(acc_id):
         return next((a["name"] for a in state["accounts"] if a["id"] == acc_id), acc_id or "")
@@ -721,26 +723,68 @@ def list_transactions(state, args):
         notes = (t.get("notes") or "").strip()
         return f' | notes: "{notes}"' if notes else ""
 
+    def floor_warning(bucket_id, r):
+        text = f"exceeded {bucket_label(state, bucket_id)}'s balance by {r['shortfall']:.2f} {currency}."
+        if r["coveredBy"]:
+            covered = ", ".join(f"{bucket_label(state, c['id'])} {c['amount']:.2f}" for c in r["coveredBy"])
+            text += f" covered by {covered}."
+        if r["stillShort"] > 0.004:
+            text += f" {r['stillShort']:.2f} {currency} still short - no bucket had enough left."
+        return f" | WARNING: {text}"
+
     lines = []
     for t in shown:
         acc = account_name(t.get("accountId"))
         tid = t.get("id", "")
-        if t.get("type") == "income":
+        ttype = t.get("type")
+        warning = floor_warning(t.get("bucketId"), tx_floor_notes[tid]) if tid in tx_floor_notes else ""
+        if ttype == "income":
             pending_tag = " (pending)" if t.get("pending") else ""
             lines.append(
                 f'[{tid}] {t.get("date")} | income | +{t.get("amount", 0):.2f} {currency}{pending_tag} | '
-                f'"{t.get("description", "")}" | {acc}{notes_suffix(t)}'
+                f'"{t.get("description", "")}" | into {acc}{notes_suffix(t)}'
             )
-        elif t.get("type") == "expense":
+        elif ttype == "expense":
             b = bucket_label(state, t.get("bucketId"))
             lines.append(
                 f'[{tid}] {t.get("date")} | expense | -{t.get("amount", 0):.2f} {currency} | {b} | '
-                f'"{t.get("description", "")}" | {acc}{notes_suffix(t)}'
+                f'"{t.get("description", "")}" | from {acc}{notes_suffix(t)}{warning}'
+            )
+        elif ttype == "transfer":
+            to_acc = account_name(t.get("toAccountId"))
+            lines.append(
+                f'[{tid}] {t.get("date")} | transfer | {t.get("amount", 0):.2f} {currency} | '
+                f'"{t.get("description", "")}" | {acc} → {to_acc}{notes_suffix(t)}'
+            )
+        elif ttype == "payout":
+            b = bucket_label(state, t.get("bucketId"))
+            from_acc = account_name(t.get("fromAccountId")) if t.get("fromAccountId") else None
+            to_acc = account_name(t.get("toAccountId")) if t.get("toAccountId") else None
+            to_bucket = bucket_label(state, t["toBucketId"]) if t.get("toBucketId") else None
+            route = f"out of {b}"
+            if from_acc:
+                route += f" ({from_acc})"
+            if to_bucket:
+                route += f" → into {to_bucket}"
+            elif to_acc:
+                route += f" → into {to_acc}"
+            lines.append(
+                f'[{tid}] {t.get("date")} | payout | -{t.get("amount", 0):.2f} {currency} | '
+                f'"{t.get("description", "")}" | {route}{notes_suffix(t)}{warning}'
+            )
+        elif ttype == "opening_balance":
+            allocation = t.get("allocation") or {}
+            alloc_str = ", ".join(f"{bucket_label(state, bid)} {amt:.2f}" for bid, amt in allocation.items())
+            lines.append(
+                f'[{tid}] {t.get("date")} | opening_balance | +{t.get("amount", 0):.2f} {currency} | '
+                f'"{t.get("description", "")}" | into {acc}'
+                + (f" | allocated: {alloc_str}" if alloc_str else "")
+                + notes_suffix(t)
             )
         else:
             lines.append(
-                f'[{tid}] {t.get("date")} | {t.get("type")} | {t.get("amount", 0):.2f} {currency} | '
-                f'"{t.get("description", "")}"{notes_suffix(t)}'
+                f'[{tid}] {t.get("date")} | {ttype} | {t.get("amount", 0):.2f} {currency} | '
+                f'"{t.get("description", "")}"{notes_suffix(t)}{warning}'
             )
 
     header = f"Showing {len(shown)} of {total_matches} matching transaction(s), newest first. [id] is what delete_transaction needs:"
@@ -994,12 +1038,12 @@ TOOLS = [
     },
     {
         "name": "list_transactions",
-        "description": "List individual transactions (newest first), optionally filtered by type, bucket, or a start date. Use this for specific questions like \"what did I spend on X\" or \"show my last few transactions\" - get_summary only gives bucket totals, not line items.",
+        "description": "List individual transactions (newest first), optionally filtered by type, bucket, or a start date. Use this for specific questions like \"what did I spend on X\" or \"show my last few transactions\" - get_summary only gives bucket totals, not line items. Each line includes the real from/to account(s) or bucket(s) the money moved between, and a WARNING note when the transaction exceeded its bucket's balance and had to cascade from another bucket to cover it.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "limit": {"type": "number", "description": "Max transactions to return, default 20, max 200"},
-                "type": {"type": "string", "enum": ["income", "expense"], "description": "Filter to just income or just expenses"},
+                "type": {"type": "string", "enum": ["income", "expense", "payout", "transfer", "opening_balance"], "description": "Filter to just one transaction type"},
                 "bucket": {"type": "string", "description": 'Filter to transactions touching one bucket, by name (e.g. "Opex")'},
                 "since": {"type": "string", "description": "YYYY-MM-DD - only transactions on or after this date"},
             },
