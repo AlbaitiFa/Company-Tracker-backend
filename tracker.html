@@ -563,7 +563,8 @@
 </button>
 
 <section class="block">
-  <div id="stepPromptSection"></div>
+  <div id="secondaryBucketGrid"></div>
+  <div id="stepPromptSection" style="margin-top: 12px;"></div>
   <div id="incomeChartSection" style="margin-top: 12px;"></div>
   <div id="compositionSection" style="margin-top: 12px;"></div>
 </section>
@@ -1648,11 +1649,13 @@
 
   function renderBuckets(derived) {
     var container = document.getElementById("bucketGrid");
+    var secondaryContainer = document.getElementById("secondaryBucketGrid");
     var totalPending = state.buckets.reduce(function (s, b) { return s + (derived.bucketPending[b.id] || 0); }, 0);
     var incomeCardHtml = renderIncomeCard(totalPending);
 
     if (!state.buckets.length) {
       container.innerHTML = '<div class="bucket-grid">' + incomeCardHtml + '</div><div class="empty-state">No buckets configured. Add some in Settings.</div>';
+      secondaryContainer.innerHTML = "";
       return;
     }
 
@@ -1667,7 +1670,11 @@
       '</div>';
     }
 
-    container.innerHTML = section("Primary", "primary", primaryBuckets, incomeCardHtml) + section("Secondary", "secondary", secondaryBuckets, "");
+    // Secondary buckets render into their own container, outside #frozenTop
+    // (see the HTML) - they're "harder-to-touch" accounts you check on
+    // rarely, not the everyday-glance summary the freeze is meant for.
+    container.innerHTML = section("Primary", "primary", primaryBuckets, incomeCardHtml);
+    secondaryContainer.innerHTML = section("Secondary", "secondary", secondaryBuckets, "");
   }
 
   function monthStartStr(dateStr) { return dateStr.slice(0, 7) + "-01"; }
@@ -2899,12 +2906,17 @@
   }
 
   /* ---------------- bucket grid actions ---------------- */
-  document.getElementById("bucketGrid").addEventListener("click", function (e) {
+  function handleBucketGridClick(e) {
     if (e.target.closest('[data-action="distribute"]')) { openDistributeSheet(); return; }
     if (e.target.closest('[data-action="confirm-all"]')) { confirmAllPending(); return; }
     var infoBtn = e.target.closest('[data-info-tier]');
     if (infoBtn) { showToast(TIER_INFO[infoBtn.getAttribute("data-info-tier")] || ""); return; }
-  });
+  }
+  document.getElementById("bucketGrid").addEventListener("click", handleBucketGridClick);
+  // Secondary buckets render into their own container (see renderBuckets) -
+  // kept out of #frozenTop on purpose, but still needs the same actions
+  // (right now just its "i" info-dot).
+  document.getElementById("secondaryBucketGrid").addEventListener("click", handleBucketGridClick);
 
   /* ---------------- ledger actions ---------------- */
   document.getElementById("ledgerSection").addEventListener("click", function (e) {
