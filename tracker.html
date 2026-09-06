@@ -133,6 +133,69 @@
     outline: 2px solid var(--focus); outline-offset: 2px;
   }
 
+  /* Accounts + Buckets - NOT pinned by default, scrolls normally with
+     everything else. Once scrolled down past a threshold, a subtle
+     freeze-arrow fades in offering to pin it right under the topbar for
+     that scroll-down session; scrolling back to the top resets to the
+     unfrozen default for next time (updateFreezeUI() in the global wiring
+     section), so there's no separate on/off setting to manage or get
+     stuck in. --topbar-h is measured in JS (the header's height isn't
+     fixed, it's padding-based) since a sticky element's `top` has to
+     match whatever's already stuck above it. */
+  .frozen-top { background: var(--paper); padding-bottom: 10px; position: relative; }
+  .frozen-top.is-frozen {
+    /* Pinned 8px (the blur radius) higher than the header's edge and tucked
+       behind it (lower z-index) - two adjacent boxes each running their own
+       backdrop-filter can't blur across their shared edge, so butting them
+       together exactly at that edge leaves a visible seam/shadow where one
+       blur abruptly cuts off and the other begins. Overlapping them by the
+       blur radius hides the seam entirely behind the header - the header's
+       own blur then reads a bit of this layer instead of raw scrolled
+       content there, so the two blend rather than meet at a hard line. */
+    position: sticky; top: calc(var(--topbar-h, 64px) - 8px); z-index: 15;
+    /* Compensates the 8px pull upward above (padding, not margin - a
+       child's margin-top here collapses through into the parent's own
+       box and cancels the offset out; padding can't collapse). */
+    padding-top: 8px;
+    border-bottom: 1px solid var(--border);
+    /* Same translucent-blur treatment as header.topbar, so the pinned
+       block reads as one continuous glassy surface with it. */
+    background: color-mix(in srgb, var(--paper) 88%, transparent);
+    backdrop-filter: blur(8px);
+  }
+  /* The topbar's own bottom border becomes a redundant doubled line right
+     above .frozen-top's own border once frozen - hide it only then. */
+  header.topbar.frozen-active { border-bottom: none; }
+  /* Sits in normal flow right after the Buckets block (a sibling of
+     .frozen-top, not a child - it needs the whole rest of the page as
+     its sticky containing block, not just frozenTop's own short box).
+     That's what makes it travel: it starts at its natural spot right
+     under Buckets and, as you scroll, rides up with the page until it
+     hits `top`, then holds there for the rest of the scroll - it only
+     drops back to its natural spot once you scroll back near the top.
+     "Eligible" (scrolled past the threshold) just makes it hoverable;
+     actually VISIBLE needs either active scrolling (.is-active-scroll,
+     JS-timed) or a real :hover - so it shows while you're scrolling,
+     fades after you stop, and comes back the instant the mouse rests
+     where it was (touch has no hover, but a swipe keeps re-triggering
+     .is-active-scroll the same way scrolling does). */
+  .unfreeze-arrow {
+    /* --arrow-dock-top (JS-measured, see updateArrowDockVar) is topbar-h+4
+       while unfrozen, but topbar-h + the WHOLE pinned block's height once
+       frozen - the block stays pinned taking up real screen space instead
+       of scrolling away, so docking at the shallow unfrozen offset would
+       land the arrow in the middle of the pinned content instead of below
+       it. */
+    position: sticky; top: var(--arrow-dock-top, 64px);
+    display: flex; align-items: center; justify-content: center;
+    width: 30px; height: 22px; margin: 0 auto; border-radius: 999px;
+    background: var(--surface); border: 1px solid var(--border); color: var(--text-muted);
+    opacity: 0; pointer-events: none; transition: opacity 0.2s ease;
+    z-index: 16;
+  }
+  .unfreeze-arrow.eligible { pointer-events: auto; }
+  .unfreeze-arrow.eligible.is-active-scroll, .unfreeze-arrow.eligible:hover { opacity: 1; }
+
   .stats-row {
     display: flex; flex-direction: column; gap: 8px; padding: 12px 16px 0; max-width: var(--content-max); margin: 0 auto;
   }
@@ -487,12 +550,20 @@
   </div>
 </header>
 
-<div class="stats-row" id="statsRow"></div>
+<div class="frozen-top" id="frozenTop">
+  <div class="stats-row" id="statsRow"></div>
+
+  <section class="block">
+    <h2>Buckets</h2>
+    <div id="bucketGrid"></div>
+  </section>
+</div>
+<button class="unfreeze-arrow" id="unfreezeArrow" aria-label="Freeze Accounts & Buckets" title="Freeze Accounts & Buckets">
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="7 8 12 13 17 8"/><polyline points="7 14 12 19 17 14"/></svg>
+</button>
 
 <section class="block">
-  <h2>Buckets</h2>
-  <div id="bucketGrid"></div>
-  <div id="stepPromptSection" style="margin-top: 12px;"></div>
+  <div id="stepPromptSection"></div>
   <div id="incomeChartSection" style="margin-top: 12px;"></div>
   <div id="compositionSection" style="margin-top: 12px;"></div>
 </section>
@@ -3686,6 +3757,87 @@
   var syncBtnEl = document.getElementById("syncBtn");
   if (!syncEnabled()) { syncBtnEl.style.display = "none"; }
   syncBtnEl.addEventListener("click", function () { syncFromServer(false); });
+
+  // The topbar's height is padding-based, not fixed - .frozen-top (Accounts
+  // + Buckets, pinned below it) needs that exact height as its own sticky
+  // `top`, so it's measured here instead of hardcoded.
+  function updateTopbarHeightVar() {
+    var header = document.querySelector("header.topbar");
+    if (header) document.documentElement.style.setProperty("--topbar-h", header.getBoundingClientRect().height + "px");
+  }
+  updateTopbarHeightVar();
+  window.addEventListener("resize", function () {
+    updateTopbarHeightVar();
+    updateArrowDockVar(manuallyFrozen);
+  });
+
+  // Accounts + Buckets stay unfrozen (normal scroll) by default - no
+  // separate on/off setting to manage. The arrow is only eligible to show
+  // at all once scrolled past FREEZE_SCROLL_THRESHOLD (no point offering
+  // to pin/collapse something already at the top) - within that, it fades
+  // in while actively scrolling and on hover (CSS :hover, see .eligible
+  // above), fading back out once scrolling stops and the mouse isn't over
+  // it. It's a single toggle that flips both look and job with the frozen
+  // state: double-down "pin it" when unfrozen, double-up "collapse it"
+  // when frozen (updateArrowVisual below) - tapping it either freezes for
+  // this scroll-down session, or collapses back to unfrozen right away.
+  // Scrolling back near the top also resets to unfrozen either way.
+  var FREEZE_SCROLL_THRESHOLD = 24;
+  var SCROLL_IDLE_MS = 900;
+  var manuallyFrozen = false;
+  var scrollIdleTimer = null;
+  var ARROW_ICON_DOWN = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="7 8 12 13 17 8"/><polyline points="7 14 12 19 17 14"/></svg>';
+  var ARROW_ICON_UP = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="7 13 12 8 17 13"/><polyline points="7 19 12 14 17 19"/></svg>';
+  function updateArrowVisual(frozen) {
+    var btn = document.getElementById("unfreezeArrow");
+    var label = frozen ? "Collapse Accounts & Buckets" : "Freeze Accounts & Buckets";
+    btn.setAttribute("aria-label", label);
+    btn.setAttribute("title", label);
+    btn.innerHTML = frozen ? ARROW_ICON_UP : ARROW_ICON_DOWN;
+  }
+  // Unfrozen, the arrow docks just under the header (topbar-h+4) because
+  // by the time it reaches that point .frozen-top has already scrolled out
+  // of the way. Frozen, .frozen-top stays pinned and occupies real screen
+  // space instead - docking at that same shallow offset would land the
+  // arrow in the middle of the pinned accounts/buckets content instead of
+  // below it, so it needs to target topbar-h + the whole pinned block's
+  // own height instead.
+  function updateArrowDockVar(frozen) {
+    var topbarH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--topbar-h")) || 64;
+    var dock = frozen ? topbarH + document.getElementById("frozenTop").offsetHeight : topbarH + 4;
+    document.documentElement.style.setProperty("--arrow-dock-top", dock + "px");
+  }
+  function updateFreezeUI() {
+    var scrolled = window.scrollY > FREEZE_SCROLL_THRESHOLD;
+    if (!scrolled) manuallyFrozen = false;
+    var frozen = manuallyFrozen;
+    document.getElementById("frozenTop").classList.toggle("is-frozen", frozen);
+    document.getElementById("frozenTop").classList.toggle("is-scrolled", scrolled);
+    document.querySelector("header.topbar").classList.toggle("frozen-active", frozen);
+    document.getElementById("unfreezeArrow").classList.toggle("eligible", scrolled);
+    updateArrowVisual(frozen);
+    // frozen-active drops the header's 1px bottom border (avoids a doubled
+    // line against .frozen-top's own border) - that shrinks the header by
+    // 1px, so --topbar-h has to be remeasured right here, or .frozen-top's
+    // sticky `top` stays pinned to the old (taller) height and leaves a
+    // 1px void above it.
+    updateTopbarHeightVar();
+    updateArrowDockVar(frozen);
+  }
+  function markActivelyScrolling() {
+    document.getElementById("unfreezeArrow").classList.add("is-active-scroll");
+    clearTimeout(scrollIdleTimer);
+    scrollIdleTimer = setTimeout(function () {
+      document.getElementById("unfreezeArrow").classList.remove("is-active-scroll");
+    }, SCROLL_IDLE_MS);
+  }
+  window.addEventListener("scroll", function () { updateFreezeUI(); markActivelyScrolling(); }, { passive: true });
+  updateFreezeUI();
+  document.getElementById("unfreezeArrow").addEventListener("click", function () {
+    manuallyFrozen = !manuallyFrozen;
+    updateFreezeUI();
+  });
+
   document.getElementById("txOverlay").addEventListener("click", function (e) { if (e.target.id === "txOverlay") closeTxSheet(); });
   document.getElementById("settingsOverlay").addEventListener("click", function (e) { if (e.target.id === "settingsOverlay") closeSettingsSheet(); });
   document.getElementById("assessOverlay").addEventListener("click", function (e) { if (e.target.id === "assessOverlay") closeAssessSheet(); });
