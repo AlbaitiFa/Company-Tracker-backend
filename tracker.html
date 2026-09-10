@@ -631,6 +631,10 @@
   <div class="sheet" role="dialog" aria-modal="true" id="obSheet"></div>
 </div>
 
+<div class="overlay" id="bugReportOverlay">
+  <div class="sheet" role="dialog" aria-modal="true" id="bugReportSheet"></div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -2935,6 +2939,14 @@
   function helpIcon() {
     return '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>';
   }
+  function bugIcon() {
+    return '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+      '<path d="m8 2 1.88 1.88"/><path d="M14.12 3.88 16 2"/><path d="M9 7.13v-1a3.003 3.003 0 1 1 6 0v1"/>' +
+      '<path d="M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6"/>' +
+      '<path d="M12 20v-9"/><path d="M6.53 9C4.6 8.8 3 7.1 3 5"/><path d="M6 13H2"/>' +
+      '<path d="M3 21c0-2.1 1.7-3.9 3.8-4"/><path d="M20.97 5c0 2.1-1.6 3.8-3.5 4"/><path d="M22 13h-4"/><path d="M17.2 17c2.1.1 3.8 1.9 3.8 4"/>' +
+    '</svg>';
+  }
 
   function confirmAllPending() {
     var any = false;
@@ -3009,6 +3021,7 @@
     var cSum = capSum(), tSum = tapSum();
 
     var html = '<div class="sheet-head"><h3>Settings</h3><div style="display:flex; align-items:center; gap:6px;">' +
+      (syncEnabled() ? '<button class="icon-btn" id="setBugReportBtn" aria-label="Report a bug" title="Report a bug">' + bugIcon() + '</button>' : '') +
       '<button class="icon-btn" id="setHelpBtn" aria-label="Help" title="Replay settings tour">' + helpIcon() + '</button>' +
       '<button class="icon-btn" id="setClose" aria-label="Close">' + xIcon() + '</button>' +
     '</div></div>';
@@ -3161,20 +3174,6 @@
       '<button class="btn btn-danger" id="resetBtn" style="margin-top:10px">Reset all data</button>' +
       '</div>';
 
-    // Sync-only: a report has nowhere to go without the backend it POSTs
-    // to. Deliberately not part of the synced app state (see
-    // append_bugreport in server.py) - it goes straight to whoever checks
-    // the admin page, not into this device's own Settings.
-    if (syncEnabled()) {
-      html += '<div class="settings-section" id="settingsSectionFeedback"><h4>Feedback</h4>' +
-        '<div class="field"><label>Found something broken, or have a suggestion?</label>' +
-          '<textarea class="input" id="bugReportMessage" placeholder="What happened?" style="min-height:84px; resize:vertical"></textarea>' +
-        '</div>' +
-        '<button class="btn" id="bugReportSubmit">Send</button>' +
-        '<div class="ledger-note" id="bugReportNote" style="margin-top:8px; display:none"></div>' +
-        '</div>';
-    }
-
     sheet.innerHTML = html;
     wireSettingsSheet();
   }
@@ -3183,6 +3182,8 @@
     var sheet = document.getElementById("settingsSheet");
     sheet.querySelector("#setClose").addEventListener("click", closeSettingsSheet);
     sheet.querySelector("#setHelpBtn").addEventListener("click", startSettingsTour);
+    var bugReportBtn = sheet.querySelector("#setBugReportBtn");
+    if (bugReportBtn) bugReportBtn.addEventListener("click", openBugReportSheet);
 
     sheet.querySelector("#sBusiness").addEventListener("input", function (e) { state.business = e.target.value; persist(); document.getElementById("brandName").textContent = state.business || "Company Tracker"; });
     sheet.querySelector("#sCurrency").addEventListener("input", function (e) { state.currency = e.target.value; persist(); });
@@ -3389,13 +3390,36 @@
     sheet.querySelector("#importBtn").addEventListener("click", function () { sheet.querySelector("#importFile").click(); });
     sheet.querySelector("#importFile").addEventListener("change", handleImport);
     sheet.querySelector("#resetBtn").addEventListener("click", handleReset);
+  }
 
-    var bugSubmitBtn = sheet.querySelector("#bugReportSubmit");
-    if (bugSubmitBtn) bugSubmitBtn.addEventListener("click", handleBugReportSubmit);
+  /* ---------------- bug report popup ---------------- */
+  // A report has nowhere to go without the backend it POSTs to, and the
+  // trigger button is only rendered in Settings' header when syncEnabled()
+  // anyway - so this is never opened in sync-disabled mode.
+  function openBugReportSheet() {
+    document.getElementById("bugReportOverlay").classList.add("open");
+    renderBugReportSheet();
+  }
+  function closeBugReportSheet() {
+    document.getElementById("bugReportOverlay").classList.remove("open");
+  }
+
+  function renderBugReportSheet() {
+    var sheet = document.getElementById("bugReportSheet");
+    sheet.innerHTML =
+      '<div class="sheet-head"><h3>Report a bug</h3><button class="icon-btn" id="bugReportClose" aria-label="Close">' + xIcon() + '</button></div>' +
+      '<div class="field"><label>What happened?</label>' +
+        '<textarea class="input" id="bugReportMessage" placeholder="Describe what you saw and what you expected instead" style="min-height:110px; resize:vertical" autofocus></textarea>' +
+      '</div>' +
+      '<button type="button" class="btn btn-primary" id="bugReportSubmit">Send</button>' +
+      '<div class="ledger-note" id="bugReportNote" style="margin-top:10px; display:none"></div>';
+
+    sheet.querySelector("#bugReportClose").addEventListener("click", closeBugReportSheet);
+    sheet.querySelector("#bugReportSubmit").addEventListener("click", handleBugReportSubmit);
   }
 
   function handleBugReportSubmit() {
-    var sheet = document.getElementById("settingsSheet");
+    var sheet = document.getElementById("bugReportSheet");
     var textarea = sheet.querySelector("#bugReportMessage");
     var note = sheet.querySelector("#bugReportNote");
     var btn = sheet.querySelector("#bugReportSubmit");
@@ -3958,12 +3982,14 @@
   document.getElementById("settingsOverlay").addEventListener("click", function (e) { if (e.target.id === "settingsOverlay") closeSettingsSheet(); });
   document.getElementById("assessOverlay").addEventListener("click", function (e) { if (e.target.id === "assessOverlay") closeAssessSheet(); });
   document.getElementById("distributeOverlay").addEventListener("click", function (e) { if (e.target.id === "distributeOverlay") closeDistributeSheet(); });
+  document.getElementById("bugReportOverlay").addEventListener("click", function (e) { if (e.target.id === "bugReportOverlay") closeBugReportSheet(); });
   document.addEventListener("keydown", function (e) {
     if (e.key !== "Escape") return;
     if (document.getElementById("txOverlay").classList.contains("open")) closeTxSheet();
     if (document.getElementById("settingsOverlay").classList.contains("open")) closeSettingsSheet();
     if (document.getElementById("assessOverlay").classList.contains("open")) closeAssessSheet();
     if (document.getElementById("distributeOverlay").classList.contains("open")) closeDistributeSheet();
+    if (document.getElementById("bugReportOverlay").classList.contains("open")) closeBugReportSheet();
     if (document.getElementById("confirmOverlay").classList.contains("open")) document.getElementById("confirmOverlay").classList.remove("open");
   });
   window.addEventListener("beforeunload", function (e) {
