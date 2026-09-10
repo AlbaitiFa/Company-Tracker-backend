@@ -169,6 +169,47 @@ def write_state(state):
         raise RuntimeError(f"Upstash write did not confirm OK: {result}")
 
 
+# ---- bug reports (separate key, not part of app state) ------------------
+# Deliberately its own key rather than a field on the synced app state -
+# a report submitted through the app should reach whoever's checking the
+# admin page, not sit visible in the reporter's own Settings (nothing in
+# tracker.html reads this key at all, so there's no UI surface for it there
+# even by accident).
+BUGREPORTS_KEY = "profit_first_tracker_bugreports"
+
+
+def read_bugreports():
+    try:
+        result = _upstash_request("GET", "/get/" + BUGREPORTS_KEY)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+        print("Upstash read failed:", e, file=sys.stderr)
+        return []
+    value = result.get("result")
+    if value is None:
+        return []
+    try:
+        return json.loads(value) or []
+    except json.JSONDecodeError:
+        return []
+
+
+def append_bugreport(message, context):
+    reports = read_bugreports()
+    reports.append({
+        "id": uid(),
+        "message": message,
+        "context": context,
+        "createdAt": int(time.time() * 1000),
+    })
+    # A trial tester mashing "submit" shouldn't be able to grow this
+    # unbounded - keep the most recent 200 and quietly drop older ones.
+    reports = reports[-200:]
+    body = json.dumps(reports).encode("utf-8")
+    result = _upstash_request("POST", "/set/" + BUGREPORTS_KEY, body=body)
+    if result.get("result") != "OK":
+        raise RuntimeError(f"Upstash write did not confirm OK: {result}")
+
+
 # Python's round() uses banker's rounding (.5 -> nearest even); JS's
 # Math.round() always rounds .5 up. These two mirror
 # profit-first-tracker.html's round2()/Math.round() exactly so a split like
@@ -1219,6 +1260,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/state":
             state = read_state()
             return self._send(200 if state else 404, state or {"error": "No state saved yet"})
+        if self.path == "/api/bugreports":
+            return self._send(200, {"reports": read_bugreports()})
         self._send(404, {"error": "Not found"})
 
     def do_PUT(self):
@@ -1246,6 +1289,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
             status, resp_body = handle_mcp(body)
             return self._send(status, resp_body)
+        if self.path == "/api/bugreports":
+            try:
+                body = json.loads(self._body())
+            except json.JSONDecodeError:
+                return self._send(400, {"error": "Invalid JSON body"})
+            message = (body.get("message") or "").strip()
+            if not message:
+                return self._send(400, {"error": "message is required"})
+            try:
+                append_bugreport(message[:4000], (body.get("context") or "")[:500])
+            except Exception as e:
+                return self._send(502, {"error": f"Storage write failed: {e}"})
+            return self._send(200, {"ok": True})
         self._send(404, {"error": "Not found"})
 
 

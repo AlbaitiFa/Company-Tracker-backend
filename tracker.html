@@ -3161,6 +3161,20 @@
       '<button class="btn btn-danger" id="resetBtn" style="margin-top:10px">Reset all data</button>' +
       '</div>';
 
+    // Sync-only: a report has nowhere to go without the backend it POSTs
+    // to. Deliberately not part of the synced app state (see
+    // append_bugreport in server.py) - it goes straight to whoever checks
+    // the admin page, not into this device's own Settings.
+    if (syncEnabled()) {
+      html += '<div class="settings-section" id="settingsSectionFeedback"><h4>Feedback</h4>' +
+        '<div class="field"><label>Found something broken, or have a suggestion?</label>' +
+          '<textarea class="input" id="bugReportMessage" placeholder="What happened?" style="min-height:84px; resize:vertical"></textarea>' +
+        '</div>' +
+        '<button class="btn" id="bugReportSubmit">Send</button>' +
+        '<div class="ledger-note" id="bugReportNote" style="margin-top:8px; display:none"></div>' +
+        '</div>';
+    }
+
     sheet.innerHTML = html;
     wireSettingsSheet();
   }
@@ -3375,6 +3389,47 @@
     sheet.querySelector("#importBtn").addEventListener("click", function () { sheet.querySelector("#importFile").click(); });
     sheet.querySelector("#importFile").addEventListener("change", handleImport);
     sheet.querySelector("#resetBtn").addEventListener("click", handleReset);
+
+    var bugSubmitBtn = sheet.querySelector("#bugReportSubmit");
+    if (bugSubmitBtn) bugSubmitBtn.addEventListener("click", handleBugReportSubmit);
+  }
+
+  function handleBugReportSubmit() {
+    var sheet = document.getElementById("settingsSheet");
+    var textarea = sheet.querySelector("#bugReportMessage");
+    var note = sheet.querySelector("#bugReportNote");
+    var btn = sheet.querySelector("#bugReportSubmit");
+    var message = (textarea.value || "").trim();
+    if (!message) { textarea.focus(); return; }
+    btn.disabled = true;
+    btn.textContent = "Sending…";
+    // Just enough to place the report without being a tracking payload -
+    // which business/version this came from, and the reporter's own device/
+    // browser, since "it doesn't work" is otherwise unreproducible.
+    var context = (state.business || "Unknown business") + " · " + (state.version || "?") + " · " + navigator.userAgent;
+    fetch(SYNC_URL + "/api/bugreports", {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + SYNC_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({ message: message, context: context })
+    })
+      .then(function (res) { return res.ok; })
+      .then(function (ok) {
+        btn.disabled = false;
+        btn.textContent = "Send";
+        note.style.display = "";
+        if (ok) {
+          textarea.value = "";
+          note.textContent = "Sent — thank you.";
+        } else {
+          note.textContent = "Couldn't send that just now — try again in a moment.";
+        }
+      })
+      .catch(function () {
+        btn.disabled = false;
+        btn.textContent = "Send";
+        note.style.display = "";
+        note.textContent = "Couldn't send that just now — check your connection and try again.";
+      });
   }
 
   function computeAdjustedCaps(rawByBucket, buckets) {
