@@ -535,15 +535,17 @@
   /* ---------------- first-run tutorial ---------------- */
   .tutorial-clickcatch { position: fixed; inset: 0; z-index: 299; background: transparent; }
   .tutorial-spotlight {
+    /* No top/left/width/height transition: scrolling is left enabled during
+       the tour (repositionTutorialBoxes runs on every scroll event to keep
+       this glued to its target), and an eased transition would make it
+       visibly lag a beat behind a scrolling page instead of tracking it. */
     position: fixed; z-index: 300; border-radius: 12px; pointer-events: none;
     box-shadow: 0 0 0 9999px rgba(10, 14, 12, 0.62), 0 0 0 3px var(--accent);
-    transition: top .25s ease, left .25s ease, width .25s ease, height .25s ease;
   }
   .tutorial-tooltip {
     position: fixed; z-index: 301; width: min(300px, calc(100vw - 32px));
     background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
     padding: 14px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
-    transition: top .25s ease, left .25s ease;
   }
   .tutorial-tooltip-title { font-family: var(--font-display); font-size: 1.05rem; font-weight: 700; color: var(--ink); margin-bottom: 4px; }
   .tutorial-tooltip-body { font-size: 0.85rem; color: var(--text-muted); line-height: 1.4; }
@@ -3942,7 +3944,8 @@
     tutorialStepIndex = 0;
     buildTutorialDom();
     showTutorialStep();
-    window.addEventListener("resize", handleTutorialResize);
+    window.addEventListener("resize", handleTutorialReposition);
+    window.addEventListener("scroll", handleTutorialReposition, { passive: true });
   }
 
   function buildTutorialDom() {
@@ -3962,50 +3965,13 @@
   }
 
   function endTutorial() {
-    window.removeEventListener("resize", handleTutorialResize);
-    unlockPageScroll();
+    window.removeEventListener("resize", handleTutorialReposition);
+    window.removeEventListener("scroll", handleTutorialReposition);
     ["tutorialClickcatch", "tutorialSpotlight", "tutorialTooltip"].forEach(function (id) {
       var el = document.getElementById(id);
       if (el) el.remove();
     });
     markTutorialSeen();
-  }
-
-  // The full-screen click-catcher already blocks clicks reaching anything
-  // behind it, but scrolling isn't a click - a wheel, a touch drag, or an
-  // arrow/space/Page Down keypress would still move the real page (and
-  // fire this page's own scroll-driven "freeze" header logic) right under
-  // a spotlight that's pinned to a fixed on-screen position, instantly
-  // desyncing it from the target. Locked while a step is being read;
-  // briefly unlocked around each step's own scrollIntoView (see
-  // showTutorialStep) since that needs the page to actually scroll.
-  var tutorialLockedHtmlOverflow = null, tutorialLockedBodyOverflow = null;
-  var TUTORIAL_SCROLL_KEYCODES = { 32: 1, 33: 1, 34: 1, 35: 1, 36: 1, 37: 1, 38: 1, 39: 1, 40: 1 };
-  function tutorialBlockWheel(e) { e.preventDefault(); }
-  function tutorialBlockKeydown(e) {
-    var tip = document.getElementById("tutorialTooltip");
-    if (tip && tip.contains(document.activeElement)) return; // Next/Back/Skip stay keyboard-usable
-    if (TUTORIAL_SCROLL_KEYCODES[e.keyCode]) e.preventDefault();
-  }
-  function lockPageScroll() {
-    if (tutorialLockedBodyOverflow !== null) return;
-    tutorialLockedHtmlOverflow = document.documentElement.style.overflow;
-    tutorialLockedBodyOverflow = document.body.style.overflow;
-    document.documentElement.style.overflow = "hidden";
-    document.body.style.overflow = "hidden";
-    document.addEventListener("wheel", tutorialBlockWheel, { passive: false });
-    document.addEventListener("touchmove", tutorialBlockWheel, { passive: false });
-    document.addEventListener("keydown", tutorialBlockKeydown);
-  }
-  function unlockPageScroll() {
-    if (tutorialLockedBodyOverflow === null) return;
-    document.documentElement.style.overflow = tutorialLockedHtmlOverflow;
-    document.body.style.overflow = tutorialLockedBodyOverflow;
-    tutorialLockedHtmlOverflow = null;
-    tutorialLockedBodyOverflow = null;
-    document.removeEventListener("wheel", tutorialBlockWheel);
-    document.removeEventListener("touchmove", tutorialBlockWheel);
-    document.removeEventListener("keydown", tutorialBlockKeydown);
   }
 
   // Polls `el`'s bounding rect on animation frames and calls `done` once it
@@ -4038,11 +4004,6 @@
     var step = tutorialActiveSteps[tutorialStepIndex];
     var el = document.querySelector(step.selector);
     if (!el) { nextTutorialStep(); return; }
-    // Briefly unlocked for the scrollIntoView below - the page can't
-    // scroll itself into place while overflow is locked - then relocked
-    // once the step is actually positioned, so the user can't scroll away
-    // from it while reading.
-    unlockPageScroll();
     el.scrollIntoView({ block: "center", behavior: "smooth" });
     // A fixed delay isn't reliable here: the smooth scroll itself has no
     // fixed duration, and this page's own scroll-driven "freeze" header
@@ -4052,21 +4013,16 @@
     // leaves the spotlight aimed at where the target USED to be. Polling
     // until the target's own rect stops moving between two checks (rather
     // than guessing a duration) is what actually waits for both to settle.
-    waitForLayoutSettle(el, function () {
-      positionTutorial(el, step);
-      lockPageScroll();
-    });
+    waitForLayoutSettle(el, function () { positionTutorial(el, step); });
   }
 
+  // Builds this step's tooltip content and wires its buttons - called once
+  // per step. Positioning itself (repositionTutorialBoxes) is split out so
+  // scroll/resize can re-run just the geometry, cheaply, without rebuilding
+  // the content or re-attaching listeners on every scroll event.
   function positionTutorial(el, step) {
-    var rect = el.getBoundingClientRect();
-    var pad = 8;
     var spot = document.getElementById("tutorialSpotlight");
     if (!spot) return; // tour was skipped/ended during the scroll delay
-    spot.style.top = (rect.top - pad) + "px";
-    spot.style.left = (rect.left - pad) + "px";
-    spot.style.width = (rect.width + pad * 2) + "px";
-    spot.style.height = (rect.height + pad * 2) + "px";
 
     var isFirst = tutorialStepIndex === 0;
     var isLast = tutorialStepIndex === tutorialActiveSteps.length - 1;
@@ -4083,9 +4039,33 @@
         '</div>' +
       '</div>';
 
-    // Measured only after the real content is in place, so offsetWidth/
-    // Height reflect this step's actual title/body length rather than a
-    // stale size left over from the previous step.
+    repositionTutorialBoxes(el);
+
+    document.getElementById("tutorialSkip").addEventListener("click", endTutorial);
+    document.getElementById("tutorialNext").addEventListener("click", function () {
+      if (isLast) endTutorial(); else nextTutorialStep();
+    });
+    var prevBtn = document.getElementById("tutorialPrev");
+    if (prevBtn) prevBtn.addEventListener("click", prevTutorialStep);
+  }
+
+  // Pure geometry - moves the spotlight cutout and tooltip to wherever `el`
+  // is on screen right now, without touching the tooltip's content or
+  // listeners. Scrolling is intentionally left free during the tour (only
+  // clicking the real page is blocked, via the click-catcher) so this runs
+  // on every scroll/resize to keep the spotlight glued to its target
+  // instead of drifting off it.
+  function repositionTutorialBoxes(el) {
+    var spot = document.getElementById("tutorialSpotlight");
+    var tip = document.getElementById("tutorialTooltip");
+    if (!spot || !tip) return;
+    var rect = el.getBoundingClientRect();
+    var pad = 8;
+    spot.style.top = (rect.top - pad) + "px";
+    spot.style.left = (rect.left - pad) + "px";
+    spot.style.width = (rect.width + pad * 2) + "px";
+    spot.style.height = (rect.height + pad * 2) + "px";
+
     var tw = tip.offsetWidth, th = tip.offsetHeight;
     var vw = window.innerWidth, vh = window.innerHeight;
     var spaceBelow = vh - rect.bottom, spaceAbove = rect.top;
@@ -4094,13 +4074,6 @@
     var left = Math.max(10, Math.min(rect.left + rect.width / 2 - tw / 2, vw - tw - 10));
     tip.style.top = top + "px";
     tip.style.left = left + "px";
-
-    document.getElementById("tutorialSkip").addEventListener("click", endTutorial);
-    document.getElementById("tutorialNext").addEventListener("click", function () {
-      if (isLast) endTutorial(); else nextTutorialStep();
-    });
-    var prevBtn = document.getElementById("tutorialPrev");
-    if (prevBtn) prevBtn.addEventListener("click", prevTutorialStep);
   }
 
   function nextTutorialStep() {
@@ -4112,11 +4085,11 @@
     tutorialStepIndex = Math.max(0, tutorialStepIndex - 1);
     showTutorialStep();
   }
-  function handleTutorialResize() {
+  function handleTutorialReposition() {
     if (!document.getElementById("tutorialSpotlight")) return;
     var step = tutorialActiveSteps[tutorialStepIndex];
     var el = step && document.querySelector(step.selector);
-    if (el) positionTutorial(el, step);
+    if (el) repositionTutorialBoxes(el);
   }
 
   document.getElementById("helpBtn").addEventListener("click", startTutorial);
