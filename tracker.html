@@ -531,6 +531,31 @@
 
   input[type="file"] { display: none; }
   hr.div { border: none; border-top: 1px solid var(--border); margin: 18px 0; }
+
+  /* ---------------- first-run tutorial ---------------- */
+  .tutorial-clickcatch { position: fixed; inset: 0; z-index: 299; background: transparent; }
+  .tutorial-spotlight {
+    position: fixed; z-index: 300; border-radius: 12px; pointer-events: none;
+    box-shadow: 0 0 0 9999px rgba(10, 14, 12, 0.62), 0 0 0 3px var(--accent);
+    transition: top .25s ease, left .25s ease, width .25s ease, height .25s ease;
+  }
+  .tutorial-tooltip {
+    position: fixed; z-index: 301; width: min(300px, calc(100vw - 32px));
+    background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+    padding: 14px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+    transition: top .25s ease, left .25s ease;
+  }
+  .tutorial-tooltip-title { font-family: var(--font-display); font-size: 1.05rem; font-weight: 700; color: var(--ink); margin-bottom: 4px; }
+  .tutorial-tooltip-body { font-size: 0.85rem; color: var(--text-muted); line-height: 1.4; }
+  .tutorial-tooltip-footer { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; gap: 8px; }
+  .tutorial-tooltip-nav { display: flex; align-items: center; gap: 8px; }
+  .tutorial-tooltip-count { font-size: 0.7rem; color: var(--text-muted); }
+  .tutorial-btn {
+    padding: 7px 14px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface); font-weight: 600; font-size: 0.8rem; cursor: pointer; color: var(--text);
+  }
+  .tutorial-btn-primary { background: var(--accent); border-color: var(--accent); color: var(--paper); }
+  .tutorial-btn-icon { padding: 7px 9px; display: inline-flex; align-items: center; }
 </style>
 
 <header class="topbar">
@@ -542,6 +567,9 @@
     <div style="display:flex; align-items:center; gap:8px;">
       <button class="icon-btn" id="syncBtn" aria-label="Sync" title="Pull latest from Claude / other devices">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+      </button>
+      <button class="icon-btn" id="helpBtn" aria-label="Help" title="Replay tutorial">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
       </button>
       <button class="icon-btn" id="settingsBtn" aria-label="Settings" title="Settings">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -3877,9 +3905,172 @@
     return "";
   });
 
+  /* ---------------- first-run tutorial ---------------- */
+  // Whether the guided tour has been seen lives outside `state` on purpose -
+  // it's a per-browser UI preference, not app data, so it must never sync
+  // across devices (a synced flag would mean dismissing it on one device
+  // silently skips it on every other device that opens this tracker).
+  var TUTORIAL_KEY = STORAGE_KEY + ".tutorialSeen";
+  function tutorialSeen() { try { return localStorage.getItem(TUTORIAL_KEY) === "1"; } catch (e) { return true; } }
+  function markTutorialSeen() { try { localStorage.setItem(TUTORIAL_KEY, "1"); } catch (e) {} }
+
+  var TUTORIAL_STEPS = [
+    { selector: "#statsRow", title: "Your accounts", body: "Bank balances at a glance - tap a card to see the breakdown." },
+    { selector: "#bucketGrid", title: "Buckets", body: "Profit First splits every dollar of income across these automatically, by percentage - Profit, Owner's Pay, Tax, and Opex." },
+    { selector: "#stepPromptSection", title: "What's next", body: "The next Profit First move to make - allocate income, then pay yourself - shows up here." },
+    { selector: "#incomeChartSection", title: "Income", body: "Income received against target, month by month or year by year." },
+    { selector: "#compositionSection", title: "Composition", body: "How your money is currently split across Buckets." },
+    { selector: "#ledgerSection", title: "Ledger", body: "Every transaction - income, expenses, transfers between Buckets - lands here." },
+    { selector: "#fabBtn", title: "Add a transaction", body: "Tap here any time to log income, an expense, or a transfer." },
+    { selector: "#settingsBtn", title: "Settings", body: "Configure Buckets, accounts, and percentages here." }
+  ];
+
+  var tutorialStepIndex = 0;
+  var tutorialActiveSteps = [];
+
+  function startTutorial() {
+    // A truly fresh state still has empty-state sections (no data logged
+    // yet) rendering nothing, and pointing a spotlight at a hidden or
+    // zero-height element would just look broken - skip any step whose
+    // target isn't actually visible right now rather than force every step
+    // to exist.
+    tutorialActiveSteps = TUTORIAL_STEPS.filter(function (step) {
+      var el = document.querySelector(step.selector);
+      return el && el.getBoundingClientRect().height > 4;
+    });
+    if (!tutorialActiveSteps.length) return;
+    tutorialStepIndex = 0;
+    buildTutorialDom();
+    showTutorialStep();
+    window.addEventListener("resize", handleTutorialResize);
+  }
+
+  function buildTutorialDom() {
+    if (document.getElementById("tutorialClickcatch")) return;
+    var catcher = document.createElement("div");
+    catcher.id = "tutorialClickcatch";
+    catcher.className = "tutorial-clickcatch";
+    document.body.appendChild(catcher);
+    var spot = document.createElement("div");
+    spot.id = "tutorialSpotlight";
+    spot.className = "tutorial-spotlight";
+    document.body.appendChild(spot);
+    var tip = document.createElement("div");
+    tip.id = "tutorialTooltip";
+    tip.className = "tutorial-tooltip";
+    document.body.appendChild(tip);
+  }
+
+  function endTutorial() {
+    window.removeEventListener("resize", handleTutorialResize);
+    ["tutorialClickcatch", "tutorialSpotlight", "tutorialTooltip"].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.remove();
+    });
+    markTutorialSeen();
+  }
+
+  // Polls `el`'s bounding rect on animation frames and calls `done` once it
+  // reports the same rect on two consecutive frames (layout has stopped
+  // moving), or after ~1s as a hard fallback so a step can never hang the
+  // tour if something keeps the layout in flux.
+  function waitForLayoutSettle(el, done) {
+    var lastRect = null, stableFrames = 0, totalFrames = 0;
+    function check() {
+      var r = el.getBoundingClientRect();
+      var same = lastRect && r.top === lastRect.top && r.left === lastRect.left && r.height === lastRect.height && r.width === lastRect.width;
+      stableFrames = same ? stableFrames + 1 : 0;
+      lastRect = r;
+      totalFrames += 1;
+      if (stableFrames >= 3 || totalFrames >= 60) { done(); return; }
+      requestAnimationFrame(check);
+    }
+    requestAnimationFrame(check);
+  }
+
+  function showTutorialStep() {
+    var step = tutorialActiveSteps[tutorialStepIndex];
+    var el = document.querySelector(step.selector);
+    if (!el) { nextTutorialStep(); return; }
+    el.scrollIntoView({ block: "center", behavior: "smooth" });
+    // A fixed delay isn't reliable here: the smooth scroll itself has no
+    // fixed duration, and this page's own scroll-driven "freeze" header
+    // (updateFreezeUI, triggered by the scroll events scrollIntoView just
+    // fired) can keep resizing the topbar and shifting everything below it
+    // for a bit after the scroll visually looks done - measuring too early
+    // leaves the spotlight aimed at where the target USED to be. Polling
+    // until the target's own rect stops moving between two checks (rather
+    // than guessing a duration) is what actually waits for both to settle.
+    waitForLayoutSettle(el, function () { positionTutorial(el, step); });
+  }
+
+  function positionTutorial(el, step) {
+    var rect = el.getBoundingClientRect();
+    var pad = 8;
+    var spot = document.getElementById("tutorialSpotlight");
+    if (!spot) return; // tour was skipped/ended during the scroll delay
+    spot.style.top = (rect.top - pad) + "px";
+    spot.style.left = (rect.left - pad) + "px";
+    spot.style.width = (rect.width + pad * 2) + "px";
+    spot.style.height = (rect.height + pad * 2) + "px";
+
+    var isFirst = tutorialStepIndex === 0;
+    var isLast = tutorialStepIndex === tutorialActiveSteps.length - 1;
+    var tip = document.getElementById("tutorialTooltip");
+    tip.innerHTML =
+      '<div class="tutorial-tooltip-title">' + esc(step.title) + '</div>' +
+      '<div class="tutorial-tooltip-body">' + esc(step.body) + '</div>' +
+      '<div class="tutorial-tooltip-footer">' +
+        '<button type="button" class="link-btn" id="tutorialSkip">Skip tour</button>' +
+        '<div class="tutorial-tooltip-nav">' +
+          '<span class="tutorial-tooltip-count">' + (tutorialStepIndex + 1) + '/' + tutorialActiveSteps.length + '</span>' +
+          (isFirst ? '' : '<button type="button" class="tutorial-btn tutorial-btn-icon" id="tutorialPrev" aria-label="Back">' + backIcon() + '</button>') +
+          '<button type="button" class="tutorial-btn tutorial-btn-primary" id="tutorialNext">' + (isLast ? "Done" : "Next") + '</button>' +
+        '</div>' +
+      '</div>';
+
+    // Measured only after the real content is in place, so offsetWidth/
+    // Height reflect this step's actual title/body length rather than a
+    // stale size left over from the previous step.
+    var tw = tip.offsetWidth, th = tip.offsetHeight;
+    var vw = window.innerWidth, vh = window.innerHeight;
+    var spaceBelow = vh - rect.bottom, spaceAbove = rect.top;
+    var top = (spaceBelow >= th + 24 || spaceBelow >= spaceAbove) ? (rect.bottom + pad + 12) : (rect.top - pad - 12 - th);
+    top = Math.max(10, Math.min(top, vh - th - 10));
+    var left = Math.max(10, Math.min(rect.left + rect.width / 2 - tw / 2, vw - tw - 10));
+    tip.style.top = top + "px";
+    tip.style.left = left + "px";
+
+    document.getElementById("tutorialSkip").addEventListener("click", endTutorial);
+    document.getElementById("tutorialNext").addEventListener("click", function () {
+      if (isLast) endTutorial(); else nextTutorialStep();
+    });
+    var prevBtn = document.getElementById("tutorialPrev");
+    if (prevBtn) prevBtn.addEventListener("click", prevTutorialStep);
+  }
+
+  function nextTutorialStep() {
+    tutorialStepIndex += 1;
+    if (tutorialStepIndex >= tutorialActiveSteps.length) { endTutorial(); return; }
+    showTutorialStep();
+  }
+  function prevTutorialStep() {
+    tutorialStepIndex = Math.max(0, tutorialStepIndex - 1);
+    showTutorialStep();
+  }
+  function handleTutorialResize() {
+    if (!document.getElementById("tutorialSpotlight")) return;
+    var step = tutorialActiveSteps[tutorialStepIndex];
+    var el = step && document.querySelector(step.selector);
+    if (el) positionTutorial(el, step);
+  }
+
+  document.getElementById("helpBtn").addEventListener("click", startTutorial);
+
   var recurringCount = processRecurringTransactions();
   render();
   if (recurringCount > 0) showToast(recurringCount === 1 ? "1 recurring entry logged automatically." : (recurringCount + " recurring entries logged automatically."));
   syncFromServer(true);
+  if (!tutorialSeen()) setTimeout(startTutorial, 500);
 })();
 </script>
