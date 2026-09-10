@@ -3118,7 +3118,9 @@
     '</details>';
     html += '<div class="sum-note ' + (cSum === 100 ? "ok" : "bad") + '">CAP total: ' + cSum + '%' + (cSum === 100 ? " — splits nicely into 100%" : " — should add up to 100% or splits will be off") + '</div>';
     html += '<div class="sum-note ' + (tSum === 100 ? "ok" : "bad") + '">Goal (TAP) total: ' + tSum + '%' + (tSum === 100 ? "" : " — target percentages usually add up to 100%") + '</div>';
-    html += '<div style="margin-top:14px; padding-top:12px; border-top:1px solid var(--border);">' +
+    html += '</div>';
+
+    html += '<div class="settings-section" id="settingsSectionMilestones"><h4>Milestone pacing</h4>' +
       '<div class="field"><label>Milestone mode</label><select class="select" id="milestoneModeSelect">' +
         '<option value="amount"' + (state.milestoneMode !== "percent" ? " selected" : "") + '>Flat amount</option>' +
         '<option value="percent"' + (state.milestoneMode === "percent" ? " selected" : "") + '>% of this month\'s Real Revenue</option>' +
@@ -3127,7 +3129,6 @@
       '<div class="field" id="milestonePercentField" style="' + (state.milestoneMode === "percent" ? "" : "display:none") + '"><label>Milestone (% of this month\'s Real Revenue)</label><input class="input" type="number" step="0.1" min="0" id="milestonePercentInput" value="' + (state.milestonePercent != null ? state.milestonePercent : 5) + '"></div>' +
       '<div class="ledger-note">Every time Real Revenue logged within the current calendar month crosses another full milestone, one CAP point moves automatically — no button to press. Resets on the 1st of each month. Each step moves one point from a bucket already above its own TAP to a bucket still below its own TAP (priority Profit → Owner\'s Pay → Tax → Opex).</div>' +
     '</div>';
-    html += '</div>';
 
     html += '<div class="settings-section" id="settingsSectionAccounts"><h4>Bank Accounts</h4><div class="ledger-note" style="margin-top:-6px">Use the arrows to reorder — this order sets the display order everywhere (dashboard, dropdowns).</div>';
     html += state.accounts.map(function (a, idx) {
@@ -3946,7 +3947,8 @@
     { selector: "#settingsSectionDebt", title: "Debt", body: "If there's real company debt on the books, distributions from Profit go 100% to paying it down first until it's clear." },
     { selector: "#settingsSectionDistribution", title: "Distribution", body: "How often - and starting when in the year - the Distribute flow becomes available." },
     { selector: "#settingsSectionOwners", title: "Owners", body: "Add owners and their ownership percentages so Distribute can auto-split the bonus portion between them." },
-    { selector: "#settingsSectionBuckets", title: "Buckets", body: "CAP (current) and Goal/TAP percentages per Bucket, plus the automatic milestone-pacing settings below them." },
+    { selector: "#settingsSectionBuckets", title: "Buckets", body: "CAP (current) and Goal (TAP) percentages per Bucket - add, rename, reorder tiers, or move one between Primary and Secondary here." },
+    { selector: "#settingsSectionMilestones", title: "Milestone pacing", body: "Every time Real Revenue crosses another milestone this month, one CAP point moves automatically from a bucket above its Goal to one still below it - no button to press." },
     { selector: "#settingsSectionAccounts", title: "Bank Accounts", body: "Add and reorder accounts here - this order controls how they're listed everywhere else in the app." },
     { selector: "#settingsSectionData", title: "Data", body: "Export a backup, restore one, or reset everything." }
   ];
