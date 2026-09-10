@@ -533,7 +533,6 @@
   hr.div { border: none; border-top: 1px solid var(--border); margin: 18px 0; }
 
   /* ---------------- guided tours ---------------- */
-  .tutorial-clickcatch { position: fixed; inset: 0; z-index: 299; background: transparent; }
   .tutorial-spotlight {
     /* No top/left/width/height transition: scrolling is left enabled during
        a tour (repositionTourBoxes runs on every scroll event to keep this
@@ -3979,16 +3978,33 @@
     showTourStep();
     window.addEventListener("resize", handleTourReposition);
     tourScrollEl.addEventListener("scroll", handleTourReposition, { passive: true });
+    document.addEventListener("click", blockClickOutsideTour, true);
   }
   function startDashboardTour() { startTour("dashboard", DASHBOARD_TOUR_STEPS, window); }
   function startSettingsTour() { startTour("settings", SETTINGS_TOUR_STEPS, document.getElementById("settingsSheet")); }
 
+  // Blocking real page interaction used to be a full-viewport div sitting on
+  // top of everything (pointer-events:auto), which is what a click-blocker
+  // normally looks like - but for the Settings tour, that div's nearest
+  // scrollable ancestor is the window (it's appended to <body>, a sibling of
+  // the sheet, not a descendant), while the actual thing that should scroll
+  // is the Settings sheet's own internal overflow. A wheel/touch scroll
+  // gesture would hit the div first and get chained to the wrong container
+  // - the window scrolled (invisibly, behind the modal) while the sheet
+  // itself never moved. A capture-phase click listener blocks exactly the
+  // same interactions (anything that isn't the tooltip's own buttons)
+  // without physically sitting in the scroll-hit-test path at all, so
+  // native wheel/touch scrolling on whichever element actually owns it
+  // keeps working correctly under both tours.
+  function blockClickOutsideTour(e) {
+    var tip = document.getElementById("tutorialTooltip");
+    if (tip && tip.contains(e.target)) return;
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
   function buildTourDom() {
-    if (document.getElementById("tutorialClickcatch")) return;
-    var catcher = document.createElement("div");
-    catcher.id = "tutorialClickcatch";
-    catcher.className = "tutorial-clickcatch";
-    document.body.appendChild(catcher);
+    if (document.getElementById("tutorialSpotlight")) return;
     var spot = document.createElement("div");
     spot.id = "tutorialSpotlight";
     spot.className = "tutorial-spotlight";
@@ -4002,7 +4018,8 @@
   function endTour() {
     window.removeEventListener("resize", handleTourReposition);
     if (tourScrollEl) tourScrollEl.removeEventListener("scroll", handleTourReposition);
-    ["tutorialClickcatch", "tutorialSpotlight", "tutorialTooltip"].forEach(function (id) {
+    document.removeEventListener("click", blockClickOutsideTour, true);
+    ["tutorialSpotlight", "tutorialTooltip"].forEach(function (id) {
       var el = document.getElementById(id);
       if (el) el.remove();
     });
