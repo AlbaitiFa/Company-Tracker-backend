@@ -532,13 +532,13 @@
   input[type="file"] { display: none; }
   hr.div { border: none; border-top: 1px solid var(--border); margin: 18px 0; }
 
-  /* ---------------- first-run tutorial ---------------- */
+  /* ---------------- guided tours ---------------- */
   .tutorial-clickcatch { position: fixed; inset: 0; z-index: 299; background: transparent; }
   .tutorial-spotlight {
     /* No top/left/width/height transition: scrolling is left enabled during
-       the tour (repositionTutorialBoxes runs on every scroll event to keep
-       this glued to its target), and an eased transition would make it
-       visibly lag a beat behind a scrolling page instead of tracking it. */
+       a tour (repositionTourBoxes runs on every scroll event to keep this
+       glued to its target), and an eased transition would make it visibly
+       lag a beat behind a scrolling page instead of tracking it. */
     position: fixed; z-index: 300; border-radius: 12px; pointer-events: none;
     box-shadow: 0 0 0 9999px rgba(10, 14, 12, 0.62), 0 0 0 3px var(--accent);
   }
@@ -2933,6 +2933,9 @@
   function backIcon() {
     return '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>';
   }
+  function helpIcon() {
+    return '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>';
+  }
 
   function confirmAllPending() {
     var any = false;
@@ -2995,6 +2998,10 @@
   function openSettingsSheet() {
     document.getElementById("settingsOverlay").classList.add("open");
     renderSettingsSheet();
+    // Delayed to clear the sheet's own open transition (transform scale,
+    // .2s) - starting the tour mid-transition would measure section rects
+    // at their not-yet-settled scaled size/position.
+    if (!tourSeen("settings")) setTimeout(startSettingsTour, 350);
   }
   function closeSettingsSheet() { document.getElementById("settingsOverlay").classList.remove("open"); render(); }
 
@@ -3002,20 +3009,23 @@
     var sheet = document.getElementById("settingsSheet");
     var cSum = capSum(), tSum = tapSum();
 
-    var html = '<div class="sheet-head"><h3>Settings</h3><button class="icon-btn" id="setClose" aria-label="Close">' + xIcon() + '</button></div>';
+    var html = '<div class="sheet-head"><h3>Settings</h3><div style="display:flex; align-items:center; gap:6px;">' +
+      '<button class="icon-btn" id="setHelpBtn" aria-label="Help" title="Replay settings tour">' + helpIcon() + '</button>' +
+      '<button class="icon-btn" id="setClose" aria-label="Close">' + xIcon() + '</button>' +
+    '</div></div>';
 
-    html += '<div class="settings-section"><h4>Business</h4>' +
+    html += '<div class="settings-section" id="settingsSectionBusiness"><h4>Business</h4>' +
       '<div class="field"><label>Name</label><input class="input" id="sBusiness" value="' + esc(state.business) + '"></div>' +
       '<div class="field"><label>Currency label</label><input class="input" id="sCurrency" value="' + esc(state.currency) + '" style="max-width:120px"></div>' +
       '<label class="check-row"><input type="checkbox" id="sTrackMaterials"' + (state.trackMaterials ? " checked" : "") + '> Materials pass-through</label><div class="check-note">This business pays vendors/subcontractors pass-through costs — excluded from Real Revenue before splitting.</div>' +
       '</div>';
 
-    html += '<div class="settings-section"><h4>Instant Assessment</h4>' +
+    html += '<div class="settings-section" id="settingsSectionAssessment"><h4>Instant Assessment</h4>' +
       '<div class="ledger-note" style="margin-bottom:10px">Calculate your real starting CAP from actual historical numbers instead of guessing.</div>' +
       '<button class="btn" id="openAssess">Run Instant Assessment</button>' +
     '</div>';
 
-    html += '<div class="settings-section"><h4>Revenue-tier Goal preset</h4>' +
+    html += '<div class="settings-section" id="settingsSectionTierPreset"><h4>Revenue-tier Goal preset</h4>' +
       '<div class="field"><label>Pick your Real Revenue band</label>' +
         '<select class="select" id="tapPresetSelect">' + REVENUE_TIERS.map(function (t, i) {
           return '<option value="' + i + '">' + esc(t.label) + '  —  ' + t.profit + '/' + t.ownerspay + '/' + t.tax + '/' + t.opex + '%</option>';
@@ -3025,12 +3035,12 @@
       '<div class="ledger-note" style="margin-top:8px">From the book\'s published Target Allocation table (Profit / Owner\'s Pay / Tax / Opex). Sets Goal % only — your current CAP% is untouched.</div>' +
     '</div>';
 
-    html += '<div class="settings-section"><h4>Debt</h4>' +
+    html += '<div class="settings-section" id="settingsSectionDebt"><h4>Debt</h4>' +
       '<div class="field"><label>Company debt remaining (optional)</label><input class="input" type="number" step="0.01" min="0" id="sDebt" value="' + (state.companyDebt || 0) + '"></div>' +
       '<div class="ledger-note">Per the book: as long as this is above zero, distributing from the Profit bucket sends 100% to debt paydown first — the normal owner-bonus split resumes automatically once it hits zero. Leave at 0 if there\'s no real company debt (arrears and personal debt don\'t count).</div>' +
     '</div>';
 
-    html += '<div class="settings-section"><h4>Distribution</h4>' +
+    html += '<div class="settings-section" id="settingsSectionDistribution"><h4>Distribution</h4>' +
       '<div class="field"><label>Distribution cadence</label><select class="select" id="sCadence">' +
         '<option value="quarterly"' + (state.distributionCadence !== "annual" ? " selected" : "") + '>Quarterly</option>' +
         '<option value="annual"' + (state.distributionCadence === "annual" ? " selected" : "") + '>Annual</option>' +
@@ -3048,7 +3058,7 @@
       '<div class="ledger-note">Distribute becomes available exactly 91 days (or 365 for annual) after the fiscal start above, or after your last distribution — and stays available until you actually distribute, it doesn\'t hide itself again. Splits Profit 50/50 between owners and Vault (100% to debt first, if any is on file).</div>' +
     '</div>';
 
-    html += '<div class="settings-section"><h4>Owners</h4>';
+    html += '<div class="settings-section" id="settingsSectionOwners"><h4>Owners</h4>';
     var owners = state.owners || [];
     html += owners.map(function (o) {
       return '<div class="acct-edit-row" data-owner="' + o.id + '">' +
@@ -3096,7 +3106,7 @@
       return header + rows;
     }
 
-    html += '<div class="settings-section"><h4>Buckets</h4>';
+    html += '<div class="settings-section" id="settingsSectionBuckets"><h4>Buckets</h4>';
     html += '<details class="bucket-tier-group" open>' +
       '<summary>Primary <span class="bucket-tier-explain">— everyday accounts</span></summary>' +
       bucketSettingsGroup(primaryBucketsForSettings, "Secondary", "secondary", true) +
@@ -3120,7 +3130,7 @@
     '</div>';
     html += '</div>';
 
-    html += '<div class="settings-section"><h4>Bank Accounts</h4><div class="ledger-note" style="margin-top:-6px">Use the arrows to reorder — this order sets the display order everywhere (dashboard, dropdowns).</div>';
+    html += '<div class="settings-section" id="settingsSectionAccounts"><h4>Bank Accounts</h4><div class="ledger-note" style="margin-top:-6px">Use the arrows to reorder — this order sets the display order everywhere (dashboard, dropdowns).</div>';
     html += state.accounts.map(function (a, idx) {
       var type = a.type || "company";
       var isDefault = a.id === state.defaultAccountId || (!state.defaultAccountId && state.accounts[0] && state.accounts[0].id === a.id);
@@ -3145,7 +3155,7 @@
     html += '<div class="btn-row"><button class="add-row-btn" id="addAccount">+ Add account</button><button class="btn" id="openObBtn">Add Opening Balance</button></div></div>';
 
     html += '<hr class="div">';
-    html += '<div class="settings-section"><h4>Data</h4>' +
+    html += '<div class="settings-section" id="settingsSectionData"><h4>Data</h4>' +
       '<div class="btn-row"><button class="btn" id="exportBtn">Export backup</button><button class="btn" id="importBtn">Import backup</button></div>' +
       '<input type="file" id="importFile" accept="application/json,.json">' +
       '<button class="btn btn-danger" id="resetBtn" style="margin-top:10px">Reset all data</button>' +
@@ -3158,6 +3168,7 @@
   function wireSettingsSheet() {
     var sheet = document.getElementById("settingsSheet");
     sheet.querySelector("#setClose").addEventListener("click", closeSettingsSheet);
+    sheet.querySelector("#setHelpBtn").addEventListener("click", startSettingsTour);
 
     sheet.querySelector("#sBusiness").addEventListener("input", function (e) { state.business = e.target.value; persist(); document.getElementById("brandName").textContent = state.business || "Company Tracker"; });
     sheet.querySelector("#sCurrency").addEventListener("input", function (e) { state.currency = e.target.value; persist(); });
@@ -3907,16 +3918,18 @@
     return "";
   });
 
-  /* ---------------- first-run tutorial ---------------- */
-  // Whether the guided tour has been seen lives outside `state` on purpose -
+  /* ---------------- guided tours ---------------- */
+  // Whether a given tour has been seen lives outside `state` on purpose -
   // it's a per-browser UI preference, not app data, so it must never sync
   // across devices (a synced flag would mean dismissing it on one device
   // silently skips it on every other device that opens this tracker).
-  var TUTORIAL_KEY = STORAGE_KEY + ".tutorialSeen";
-  function tutorialSeen() { try { return localStorage.getItem(TUTORIAL_KEY) === "1"; } catch (e) { return true; } }
-  function markTutorialSeen() { try { localStorage.setItem(TUTORIAL_KEY, "1"); } catch (e) {} }
+  // Keyed per tour (dashboard/settings) so finishing one doesn't mark the
+  // other seen.
+  function tourSeenKey(tourId) { return STORAGE_KEY + ".tutorialSeen." + tourId; }
+  function tourSeen(tourId) { try { return localStorage.getItem(tourSeenKey(tourId)) === "1"; } catch (e) { return true; } }
+  function markTourSeen(tourId) { try { localStorage.setItem(tourSeenKey(tourId), "1"); } catch (e) {} }
 
-  var TUTORIAL_STEPS = [
+  var DASHBOARD_TOUR_STEPS = [
     { selector: "#statsRow", title: "Your accounts", body: "Bank balances at a glance - tap a card to see the breakdown." },
     { selector: "#bucketGrid", title: "Buckets", body: "Profit First splits every dollar of income across these automatically, by percentage - Profit, Owner's Pay, Tax, and Opex." },
     { selector: "#stepPromptSection", title: "What's next", body: "The next Profit First move to make - allocate income, then pay yourself - shows up here." },
@@ -3927,28 +3940,50 @@
     { selector: "#settingsBtn", title: "Settings", body: "Configure Buckets, accounts, and percentages here." }
   ];
 
-  var tutorialStepIndex = 0;
-  var tutorialActiveSteps = [];
+  var SETTINGS_TOUR_STEPS = [
+    { selector: "#settingsSectionBusiness", title: "Business", body: "Your business name, currency label, and whether materials pass-through costs get excluded from Real Revenue." },
+    { selector: "#settingsSectionAssessment", title: "Instant Assessment", body: "Work out real starting CAP percentages from actual historical numbers instead of guessing." },
+    { selector: "#settingsSectionTierPreset", title: "Revenue-tier Goal preset", body: "Apply the book's published Target Allocation percentages for your revenue band as your Goal (TAP)." },
+    { selector: "#settingsSectionDebt", title: "Debt", body: "If there's real company debt on the books, distributions from Profit go 100% to paying it down first until it's clear." },
+    { selector: "#settingsSectionDistribution", title: "Distribution", body: "How often - and starting when in the year - the Distribute flow becomes available." },
+    { selector: "#settingsSectionOwners", title: "Owners", body: "Add owners and their ownership percentages so Distribute can auto-split the bonus portion between them." },
+    { selector: "#settingsSectionBuckets", title: "Buckets", body: "CAP (current) and Goal/TAP percentages per Bucket, plus the automatic milestone-pacing settings below them." },
+    { selector: "#settingsSectionAccounts", title: "Bank Accounts", body: "Add and reorder accounts here - this order controls how they're listed everywhere else in the app." },
+    { selector: "#settingsSectionData", title: "Data", body: "Export a backup, restore one, or reset everything." }
+  ];
 
-  function startTutorial() {
+  // The element whose own scroll should reposition the tour - the window
+  // for the main dashboard, but the Settings sheet has its own internal
+  // overflow-y:auto scroll instead of the window scrolling, so following
+  // the window's scroll event there would never fire.
+  var tourStepIndex = 0;
+  var tourActiveSteps = [];
+  var tourScrollEl = window;
+  var activeTourId = null;
+
+  function startTour(tourId, steps, scrollEl) {
     // A truly fresh state still has empty-state sections (no data logged
     // yet) rendering nothing, and pointing a spotlight at a hidden or
     // zero-height element would just look broken - skip any step whose
     // target isn't actually visible right now rather than force every step
     // to exist.
-    tutorialActiveSteps = TUTORIAL_STEPS.filter(function (step) {
+    tourActiveSteps = steps.filter(function (step) {
       var el = document.querySelector(step.selector);
       return el && el.getBoundingClientRect().height > 4;
     });
-    if (!tutorialActiveSteps.length) return;
-    tutorialStepIndex = 0;
-    buildTutorialDom();
-    showTutorialStep();
-    window.addEventListener("resize", handleTutorialReposition);
-    window.addEventListener("scroll", handleTutorialReposition, { passive: true });
+    if (!tourActiveSteps.length) return;
+    activeTourId = tourId;
+    tourStepIndex = 0;
+    tourScrollEl = scrollEl || window;
+    buildTourDom();
+    showTourStep();
+    window.addEventListener("resize", handleTourReposition);
+    tourScrollEl.addEventListener("scroll", handleTourReposition, { passive: true });
   }
+  function startDashboardTour() { startTour("dashboard", DASHBOARD_TOUR_STEPS, window); }
+  function startSettingsTour() { startTour("settings", SETTINGS_TOUR_STEPS, document.getElementById("settingsSheet")); }
 
-  function buildTutorialDom() {
+  function buildTourDom() {
     if (document.getElementById("tutorialClickcatch")) return;
     var catcher = document.createElement("div");
     catcher.id = "tutorialClickcatch";
@@ -3964,14 +3999,15 @@
     document.body.appendChild(tip);
   }
 
-  function endTutorial() {
-    window.removeEventListener("resize", handleTutorialReposition);
-    window.removeEventListener("scroll", handleTutorialReposition);
+  function endTour() {
+    window.removeEventListener("resize", handleTourReposition);
+    if (tourScrollEl) tourScrollEl.removeEventListener("scroll", handleTourReposition);
     ["tutorialClickcatch", "tutorialSpotlight", "tutorialTooltip"].forEach(function (id) {
       var el = document.getElementById(id);
       if (el) el.remove();
     });
-    markTutorialSeen();
+    if (activeTourId) markTourSeen(activeTourId);
+    activeTourId = null;
   }
 
   // Polls `el`'s bounding rect on animation frames and calls `done` once it
@@ -4000,32 +4036,32 @@
     setTimeout(finish, 900);
   }
 
-  function showTutorialStep() {
-    var step = tutorialActiveSteps[tutorialStepIndex];
+  function showTourStep() {
+    var step = tourActiveSteps[tourStepIndex];
     var el = document.querySelector(step.selector);
-    if (!el) { nextTutorialStep(); return; }
+    if (!el) { nextTourStep(); return; }
     el.scrollIntoView({ block: "center", behavior: "smooth" });
     // A fixed delay isn't reliable here: the smooth scroll itself has no
-    // fixed duration, and this page's own scroll-driven "freeze" header
+    // fixed duration, and the dashboard's own scroll-driven "freeze" header
     // (updateFreezeUI, triggered by the scroll events scrollIntoView just
     // fired) can keep resizing the topbar and shifting everything below it
     // for a bit after the scroll visually looks done - measuring too early
     // leaves the spotlight aimed at where the target USED to be. Polling
     // until the target's own rect stops moving between two checks (rather
     // than guessing a duration) is what actually waits for both to settle.
-    waitForLayoutSettle(el, function () { positionTutorial(el, step); });
+    waitForLayoutSettle(el, function () { positionTour(el, step); });
   }
 
   // Builds this step's tooltip content and wires its buttons - called once
-  // per step. Positioning itself (repositionTutorialBoxes) is split out so
+  // per step. Positioning itself (repositionTourBoxes) is split out so
   // scroll/resize can re-run just the geometry, cheaply, without rebuilding
   // the content or re-attaching listeners on every scroll event.
-  function positionTutorial(el, step) {
+  function positionTour(el, step) {
     var spot = document.getElementById("tutorialSpotlight");
     if (!spot) return; // tour was skipped/ended during the scroll delay
 
-    var isFirst = tutorialStepIndex === 0;
-    var isLast = tutorialStepIndex === tutorialActiveSteps.length - 1;
+    var isFirst = tourStepIndex === 0;
+    var isLast = tourStepIndex === tourActiveSteps.length - 1;
     var tip = document.getElementById("tutorialTooltip");
     tip.innerHTML =
       '<div class="tutorial-tooltip-title">' + esc(step.title) + '</div>' +
@@ -4033,20 +4069,20 @@
       '<div class="tutorial-tooltip-footer">' +
         '<button type="button" class="link-btn" id="tutorialSkip">Skip tour</button>' +
         '<div class="tutorial-tooltip-nav">' +
-          '<span class="tutorial-tooltip-count">' + (tutorialStepIndex + 1) + '/' + tutorialActiveSteps.length + '</span>' +
+          '<span class="tutorial-tooltip-count">' + (tourStepIndex + 1) + '/' + tourActiveSteps.length + '</span>' +
           (isFirst ? '' : '<button type="button" class="tutorial-btn tutorial-btn-icon" id="tutorialPrev" aria-label="Back">' + backIcon() + '</button>') +
           '<button type="button" class="tutorial-btn tutorial-btn-primary" id="tutorialNext">' + (isLast ? "Done" : "Next") + '</button>' +
         '</div>' +
       '</div>';
 
-    repositionTutorialBoxes(el);
+    repositionTourBoxes(el);
 
-    document.getElementById("tutorialSkip").addEventListener("click", endTutorial);
+    document.getElementById("tutorialSkip").addEventListener("click", endTour);
     document.getElementById("tutorialNext").addEventListener("click", function () {
-      if (isLast) endTutorial(); else nextTutorialStep();
+      if (isLast) endTour(); else nextTourStep();
     });
     var prevBtn = document.getElementById("tutorialPrev");
-    if (prevBtn) prevBtn.addEventListener("click", prevTutorialStep);
+    if (prevBtn) prevBtn.addEventListener("click", prevTourStep);
   }
 
   // Pure geometry - moves the spotlight cutout and tooltip to wherever `el`
@@ -4055,7 +4091,7 @@
   // clicking the real page is blocked, via the click-catcher) so this runs
   // on every scroll/resize to keep the spotlight glued to its target
   // instead of drifting off it.
-  function repositionTutorialBoxes(el) {
+  function repositionTourBoxes(el) {
     var spot = document.getElementById("tutorialSpotlight");
     var tip = document.getElementById("tutorialTooltip");
     if (!spot || !tip) return;
@@ -4076,28 +4112,28 @@
     tip.style.left = left + "px";
   }
 
-  function nextTutorialStep() {
-    tutorialStepIndex += 1;
-    if (tutorialStepIndex >= tutorialActiveSteps.length) { endTutorial(); return; }
-    showTutorialStep();
+  function nextTourStep() {
+    tourStepIndex += 1;
+    if (tourStepIndex >= tourActiveSteps.length) { endTour(); return; }
+    showTourStep();
   }
-  function prevTutorialStep() {
-    tutorialStepIndex = Math.max(0, tutorialStepIndex - 1);
-    showTutorialStep();
+  function prevTourStep() {
+    tourStepIndex = Math.max(0, tourStepIndex - 1);
+    showTourStep();
   }
-  function handleTutorialReposition() {
+  function handleTourReposition() {
     if (!document.getElementById("tutorialSpotlight")) return;
-    var step = tutorialActiveSteps[tutorialStepIndex];
+    var step = tourActiveSteps[tourStepIndex];
     var el = step && document.querySelector(step.selector);
-    if (el) repositionTutorialBoxes(el);
+    if (el) repositionTourBoxes(el);
   }
 
-  document.getElementById("helpBtn").addEventListener("click", startTutorial);
+  document.getElementById("helpBtn").addEventListener("click", startDashboardTour);
 
   var recurringCount = processRecurringTransactions();
   render();
   if (recurringCount > 0) showToast(recurringCount === 1 ? "1 recurring entry logged automatically." : (recurringCount + " recurring entries logged automatically."));
   syncFromServer(true);
-  if (!tutorialSeen()) setTimeout(startTutorial, 500);
+  if (!tourSeen("dashboard")) setTimeout(startDashboardTour, 500);
 })();
 </script>
