@@ -376,30 +376,28 @@
   .ledger-list { display: flex; flex-direction: column; gap: 8px; }
   .ledger-item { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 11px 13px; }
   /* Legs of one split transaction (same splitGroupId): one is "focused"
-     (a full, normal .ledger-item - own Edit/Delete, not itself clickable
-     or hoverable as a stacking control) with a "Split i/N" badge chip.
-     Order is fixed at creation order and never reshuffles. Whatever comes
-     BEFORE the focused leg shows only as a blank sliver (nothing to see,
-     already stepped past); whatever comes AFTER shows as one combined
-     edge with the TOTAL of those legs' amounts, not each one's own -
-     clicking either edge steps focus one leg in that direction.
-     To actually read as a stack (not boxes sitting next to each other),
-     the rest cards sit BEHIND the focused one - z-index lower, tucked
-     partly underneath it (their inner edge is hidden under the focused
-     card's footprint) - all at the SAME height as the focused card, so
-     the amount in a rest card lines up at the same top position it would
-     in any other ledger card. Sizes/positions are set in JS
-     (sizeSplitStacks) against the stack's real measured width. */
+     (a full, normal .ledger-item - own Edit/Delete) with an "i/N" corner
+     badge. Order is fixed at creation order and never reshuffles - only
+     which leg is focused changes. EVERY other leg gets its own peeking
+     "rest" card showing its own amount (not blanked out, not combined
+     into a total) - cascading outward on whichever side it actually sits
+     relative to focus, each one tucked partly under the one closer to
+     focus (z-index lower going outward), all at the SAME height as the
+     focused card so every amount lines up at the ordinary top position.
+     Clicking a rest card jumps focus directly to that leg. Sizes/
+     positions are set in JS (sizeSplitStacks) against the stack's real
+     measured width - see there for the cascade math. */
   .split-card-stack { position: relative; }
-  .split-stack-focus { position: absolute; top: 0; z-index: 2; }
+  .split-stack-focus { position: absolute; top: 0; z-index: 100; }
   .split-stack-rest {
-    position: absolute; z-index: 1; cursor: pointer; transition: transform 0.15s ease;
+    position: absolute; top: 0; cursor: pointer;
     background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
     box-shadow: 0 3px 10px rgba(0,0,0,0.22);
     box-sizing: border-box;
+    display: flex; align-items: flex-start; padding: 11px 13px;
   }
-  .split-stack-rest-after { display: flex; align-items: flex-start; justify-content: flex-end; padding: 11px 13px; }
-  .split-stack-rest:hover { transform: translateY(-2px); }
+  .split-stack-rest-before { justify-content: flex-start; }
+  .split-stack-rest-after { justify-content: flex-end; }
   .split-corner-badge {
     font-family: var(--font-mono); font-size: 0.68rem; font-weight: 600;
     color: var(--text-muted); background: var(--surface-2);
@@ -2187,14 +2185,13 @@
   // Which leg is currently "focused" (shown in full) in each split stack -
   // UI-only (like tourSeen or ledgerFilters), keyed by splitGroupId, not
   // persisted or synced. Defaults to the first leg in CREATION order.
-  // Order never reshuffles - only which leg is focused changes, stepped
-  // via the plain "rest" edges on either side (never the focused card
-  // itself, which isn't a stacking control - it's just a normal entry).
+  // Order never reshuffles - only which leg is focused changes, by
+  // clicking directly on any other leg's own peeking card (never the
+  // focused card itself, which isn't a stacking control).
   var splitStackFocus = {};
-  var SPLIT_STACK_LEFT_PEEK = 14;
-  var SPLIT_STACK_RIGHT_PEEK = 100;
+  var SPLIT_STACK_PEEK = 92;
   var SPLIT_STACK_UNDERLAP = 18;
-  var SPLIT_STACK_MIN_FOCUS_WIDTH = 180;
+  var SPLIT_STACK_MIN_FOCUS_WIDTH = 170;
 
   function renderSplitLedgerGroup(rows) {
     var groupId = rows[0].splitGroupId;
@@ -2205,34 +2202,28 @@
     if (focusIndex < 0) focusIndex = 0;
     var focusedTx = stable[focusIndex];
 
-    var isOut = focusedTx.type === "expense" || focusedTx.type === "payout";
-    var isIn = focusedTx.type === "income" || focusedTx.type === "opening_balance";
-    var amtClass = isIn ? "pos" : (isOut ? "neg" : "");
-    var sign = isIn ? "+" : (isOut ? "−" : "");
-
-    function sumRange(fromIdx, toIdx) {
-      var s = 0;
-      for (var k = fromIdx; k <= toIdx; k++) s += Number(stable[k].amount) || 0;
-      return s;
+    // Every OTHER leg gets its own peeking card (own amount, not a blank
+    // sliver and not combined into one total) - cascading further out the
+    // more legs sit between it and focus. data-distance (1 = right next
+    // to focus) is what sizeSplitStacks uses to place and z-order them.
+    function peekCardHtml(tx, side, distance) {
+      var isOut = tx.type === "expense" || tx.type === "payout";
+      var isIn = tx.type === "income" || tx.type === "opening_balance";
+      var amtClass = isIn ? "pos" : (isOut ? "neg" : "");
+      var sign = isIn ? "+" : (isOut ? "−" : "");
+      return '<div class="split-stack-rest split-stack-rest-' + side + '" data-tx-id="' + tx.id + '" data-split-group="' + groupId + '" data-distance="' + distance + '">' +
+        '<div class="ledger-amt num ' + amtClass + '">' + curr() + ' ' + sign + fmt(tx.amount) + '</div>' +
+      '</div>';
     }
 
-    // A blank sliver for whatever comes before the focused leg (nothing to
-    // show - it's just been stepped past) and one combined "rest" edge for
-    // whatever comes after (the TOTAL of those legs, not each one's own
-    // amount) - not a cascade of individual peeks, so this never runs into
-    // the old bug where a narrow screen collapses the gap between peeks.
-    var beforeHtml = focusIndex > 0
-      ? '<div class="split-stack-rest split-stack-rest-before" data-step="prev" data-split-group="' + groupId + '"></div>'
-      : "";
-    var afterHtml = focusIndex < n - 1
-      ? '<div class="split-stack-rest split-stack-rest-after" data-step="next" data-split-group="' + groupId + '">' +
-          '<div class="ledger-amt num ' + amtClass + '">' + curr() + ' ' + sign + fmt(sumRange(focusIndex + 1, n - 1)) + '</div>' +
-        '</div>'
-      : "";
-    var focusedHtml = '<div class="split-stack-focus">' + renderLedgerItem(focusedTx, (focusIndex + 1) + "/" + n) + '</div>';
-    var orderIds = stable.map(function (tx) { return tx.id; }).join(",");
+    var beforeHtml = "";
+    for (var b = 0; b < focusIndex; b++) beforeHtml += peekCardHtml(stable[b], "before", focusIndex - b);
+    var afterHtml = "";
+    for (var a = focusIndex + 1; a < n; a++) afterHtml += peekCardHtml(stable[a], "after", a - focusIndex);
 
-    return '<div class="split-card-stack" data-split-group="' + groupId + '" data-focus-index="' + focusIndex + '" data-order="' + orderIds + '">' +
+    var focusedHtml = '<div class="split-stack-focus">' + renderLedgerItem(focusedTx, (focusIndex + 1) + "/" + n) + '</div>';
+
+    return '<div class="split-card-stack" data-split-group="' + groupId + '">' +
       beforeHtml + focusedHtml + afterHtml +
     '</div>';
   }
@@ -2241,35 +2232,51 @@
   // out from wireSplitStacks (which also attaches click listeners, only
   // needed once per render) so the window resize handler below can just
   // re-measure on rotate/resize without piling up duplicate listeners.
+  //
+  // Before-cards are all right-anchored at the focused card's left edge
+  // (tucked under it by UNDERLAP); after-cards are all left-anchored at
+  // its right edge. Within each side, width grows with distance from
+  // focus while z-index shrinks - so the card closest to focus (distance
+  // 1, highest z on its side) sits on top and only its own peek width is
+  // exposed, while a further card's EXTRA width beyond that is what peeks
+  // out past it. Same mechanism as the old single-edge cascade, just
+  // mirrored on both sides and never collapsed into one combined card.
   function sizeSplitStacks(wrap) {
     Array.prototype.forEach.call(wrap.querySelectorAll(".split-card-stack"), function (stack) {
       var containerWidth = stack.clientWidth || SPLIT_STACK_MIN_FOCUS_WIDTH;
-      var before = stack.querySelector(".split-stack-rest-before");
-      var after = stack.querySelector(".split-stack-rest-after");
       var focus = stack.querySelector(".split-stack-focus");
-      var leftPeek = before ? SPLIT_STACK_LEFT_PEEK : 0;
-      var rightPeek = after ? Math.min(SPLIT_STACK_RIGHT_PEEK, Math.max(0, containerWidth - SPLIT_STACK_MIN_FOCUS_WIDTH - leftPeek)) : 0;
-      var focusW = Math.max(SPLIT_STACK_MIN_FOCUS_WIDTH, containerWidth - leftPeek - rightPeek);
-      var focusLeft = leftPeek;
+      var befores = Array.prototype.slice.call(stack.querySelectorAll(".split-stack-rest-before"));
+      var afters = Array.prototype.slice.call(stack.querySelectorAll(".split-stack-rest-after"));
+      var m = befores.length, k = afters.length;
+
+      var maxSidePeek = Math.max(0, (containerWidth - SPLIT_STACK_MIN_FOCUS_WIDTH) / 2);
+      var leftPeekPerCard = m > 0 ? Math.min(SPLIT_STACK_PEEK, maxSidePeek / m) : 0;
+      var rightPeekPerCard = k > 0 ? Math.min(SPLIT_STACK_PEEK, maxSidePeek / k) : 0;
+      var focusW = containerWidth - leftPeekPerCard * m - rightPeekPerCard * k;
+      var focusLeft = leftPeekPerCard * m;
+
       if (focus) { focus.style.left = focusLeft + "px"; focus.style.width = focusW + "px"; }
       var h = focus ? focus.offsetHeight : 0;
       stack.style.height = h + "px";
-      // Rest cards tuck partly UNDER the focused card (hidden there, since
-      // the focused card has the higher z-index), same height as it - so
-      // the amount in a rest card sits at the same top position it would
-      // in any other ledger card, not shifted by a shorter box.
-      if (before) {
-        before.style.top = "0px";
-        before.style.height = h + "px";
-        before.style.left = "0px";
-        before.style.width = (leftPeek + SPLIT_STACK_UNDERLAP) + "px";
-      }
-      if (after) {
-        after.style.top = "0px";
-        after.style.height = h + "px";
-        after.style.left = (focusLeft + focusW - SPLIT_STACK_UNDERLAP) + "px";
-        after.style.width = (rightPeek + SPLIT_STACK_UNDERLAP) + "px";
-      }
+
+      var beforeRightEdge = focusLeft + SPLIT_STACK_UNDERLAP;
+      befores.forEach(function (card) {
+        var d = parseInt(card.getAttribute("data-distance"), 10);
+        var width = leftPeekPerCard * d + SPLIT_STACK_UNDERLAP;
+        card.style.height = h + "px";
+        card.style.width = width + "px";
+        card.style.left = (beforeRightEdge - width) + "px";
+        card.style.zIndex = String(m - d + 1);
+      });
+      var afterLeftEdge = focusLeft + focusW - SPLIT_STACK_UNDERLAP;
+      afters.forEach(function (card) {
+        var d = parseInt(card.getAttribute("data-distance"), 10);
+        var width = rightPeekPerCard * d + SPLIT_STACK_UNDERLAP;
+        card.style.height = h + "px";
+        card.style.width = width + "px";
+        card.style.left = afterLeftEdge + "px";
+        card.style.zIndex = String(k - d + 1);
+      });
     });
   }
 
@@ -2277,13 +2284,8 @@
     sizeSplitStacks(wrap);
     Array.prototype.forEach.call(wrap.querySelectorAll(".split-stack-rest"), function (el) {
       el.addEventListener("click", function () {
-        var stack = el.closest(".split-card-stack");
         var groupId = el.getAttribute("data-split-group");
-        var order = stack.getAttribute("data-order").split(",");
-        var focusIndex = parseInt(stack.getAttribute("data-focus-index"), 10);
-        var step = el.getAttribute("data-step") === "next" ? 1 : -1;
-        var newIndex = Math.max(0, Math.min(order.length - 1, focusIndex + step));
-        splitStackFocus[groupId] = order[newIndex];
+        splitStackFocus[groupId] = el.getAttribute("data-tx-id");
         renderLedgerList();
       });
     });
@@ -2542,6 +2544,7 @@
     var first = rows[0];
     var isPayout = first.type === "payout";
     var dim = splitGroupDimension(rows);
+    var totalNow = round2(rows.reduce(function (s, r) { return s + (Number(r.amount) || 0); }, 0));
 
     var destRaw = "";
     if (isPayout) {
@@ -2549,25 +2552,36 @@
       else if (first.toAccountId) destRaw = "account:" + first.toAccountId;
     }
 
-    var rowsHtml = rows.map(function (tx) {
+    // One row per existing leg, plus empty (hidden until "+ Add another")
+    // slots up to SPLIT_ROW_COUNT - same fixed-slot pattern the creation
+    // forms use. A slot's own data-existing flag is what tells
+    // handleEditSplitSave whether to update a real transaction or create
+    // a new one for that leg.
+    function rowHtml(tx, slotIndex) {
+      var rowId = tx ? tx.id : ("new" + slotIndex);
       var selectHtml = dim === "bucket"
-        ? '<select class="select" data-edit-split-bucket data-row-id="' + tx.id + '">' + bucketOptions(tx.bucketId) + '</select>'
-        : '<select class="select" data-edit-split-account data-row-id="' + tx.id + '">' + accountOptions(isPayout ? tx.fromAccountId : tx.accountId) + '</select>';
-      return '<div class="row2 split-row">' +
+        ? '<select class="select" data-edit-split-bucket data-row-id="' + rowId + '">' + bucketOptions(tx ? tx.bucketId : null) + '</select>'
+        : '<select class="select" data-edit-split-account data-row-id="' + rowId + '">' + accountOptions(tx ? (isPayout ? tx.fromAccountId : tx.accountId) : null) + '</select>';
+      return '<div class="row2 split-row" data-edit-split-row' + (tx ? "" : ' style="display:none"') + '>' +
         '<div class="field"><label>' + (dim === "bucket" ? "Bucket" : "Account") + '</label>' + selectHtml + '</div>' +
-        '<div class="field"><label>Amount</label><input class="input" type="number" step="0.01" min="0" value="' + tx.amount + '" data-edit-split-amount data-row-id="' + tx.id + '"></div>' +
+        '<div class="field"><label>Amount</label><input class="input" type="number" step="0.01" min="0" value="' + (tx ? tx.amount : "") + '" data-edit-split-amount data-row-id="' + rowId + '" data-existing="' + (tx ? "1" : "0") + '"></div>' +
       '</div>';
-    }).join("");
+    }
+    var rowsHtml = "";
+    for (var i = 0; i < SPLIT_ROW_COUNT; i++) rowsHtml += rowHtml(rows[i], i);
+    var canAddMore = rows.length < SPLIT_ROW_COUNT;
 
     sheet.innerHTML =
       '<div class="sheet-head"><h3>Edit split ' + (isPayout ? "payout" : "expense") + '</h3><button class="icon-btn" id="editSplitClose" aria-label="Close">' + xIcon() + '</button></div>' +
       '<div class="ledger-note" style="margin:-6px 0 14px">Linked as one split — ' + rows.length + ' legs sharing this date, description' + (isPayout ? ", and destination" : "") + '.</div>' +
-      '<div class="field"><label>Date</label><input class="input" type="date" id="editSplitDate" value="' + esc(first.date) + '"></div>' +
+      '<div class="row2"><div class="field"><label>Date</label><input class="input" type="date" id="editSplitDate" value="' + esc(first.date) + '"></div>' +
+      '<div class="field"><label>Amount</label><input class="input" type="number" step="0.01" min="0" id="editSplitAmount" value="' + totalNow + '"></div></div>' +
       '<div class="field"><label>Description</label><input class="input" type="text" id="editSplitDesc" value="' + esc(first.description || "") + '"></div>' +
       '<div class="field"><label>Notes (optional)</label><textarea class="input" id="editSplitNotes">' + esc(first.notes || "") + '</textarea></div>' +
       (isPayout ? '<div class="field"><label>Goes to</label><select class="select" id="editSplitDestination">' + payoutDestinationOptions(destRaw) + '</select></div>' : "") +
       rowsHtml +
-      '<div class="split-remaining" id="editSplitTotal"></div>' +
+      (canAddMore ? '<button type="button" class="link-btn" id="editSplitAddRow">+ Add another ' + (dim === "bucket" ? "bucket" : "account") + '</button>' : "") +
+      '<div class="split-remaining" id="editSplitRemaining"></div>' +
       '<button type="button" class="btn btn-primary" id="editSplitSave" style="margin-top:6px">Save changes</button>' +
       '<button type="button" class="link-btn danger" id="editSplitDeleteAll" style="margin-top:14px">Delete this split (' + rows.length + ' linked entries)</button>';
 
@@ -2579,15 +2593,34 @@
       });
     });
 
+    var splitRows = Array.prototype.slice.call(sheet.querySelectorAll("[data-edit-split-row]"));
     var amountInputs = Array.prototype.slice.call(sheet.querySelectorAll("[data-edit-split-amount]"));
-    function updateTotal() {
-      var sum = amountInputs.reduce(function (s, inp) { return s + (round2(parseFloat(inp.value) || 0)); }, 0);
-      var el = sheet.querySelector("#editSplitTotal");
-      el.className = "split-remaining ok";
-      el.textContent = "Total: " + fmt(sum) + " across " + amountInputs.length + " legs.";
+    var totalInput = sheet.querySelector("#editSplitAmount");
+    function updateRemaining() {
+      var total = round2(parseFloat(totalInput.value) || 0);
+      var sum = 0;
+      splitRows.forEach(function (row) {
+        if (row.style.display === "none") return;
+        sum += round2(parseFloat(row.querySelector("[data-edit-split-amount]").value) || 0);
+      });
+      var remaining = round2(total - sum);
+      var el = sheet.querySelector("#editSplitRemaining");
+      if (Math.abs(remaining) <= 0.004) { el.textContent = "Fully allocated."; el.className = "split-remaining ok"; }
+      else if (remaining > 0) { el.textContent = fmt(remaining) + " left to allocate."; el.className = "split-remaining bad"; }
+      else { el.textContent = fmt(Math.abs(remaining)) + " over the total amount."; el.className = "split-remaining bad"; }
     }
-    amountInputs.forEach(function (inp) { inp.addEventListener("input", updateTotal); });
-    updateTotal();
+    totalInput.addEventListener("input", updateRemaining);
+    amountInputs.forEach(function (inp) { inp.addEventListener("input", updateRemaining); });
+    var addBtn = sheet.querySelector("#editSplitAddRow");
+    if (addBtn) {
+      addBtn.addEventListener("click", function () {
+        var hiddenRow = splitRows.filter(function (r) { return r.style.display === "none"; })[0];
+        if (hiddenRow) hiddenRow.style.display = "";
+        if (!splitRows.some(function (r) { return r.style.display === "none"; })) addBtn.style.display = "none";
+        updateRemaining();
+      });
+    }
+    updateRemaining();
   }
 
   function handleEditSplitSave() {
@@ -2596,14 +2629,26 @@
     var rows = splitGroupRows(groupId);
     if (!rows.length) { closeEditSplitSheet(); return; }
     var isPayout = rows[0].type === "payout";
+    var dim = splitGroupDimension(rows);
 
     var date = sheet.querySelector("#editSplitDate").value || todayStr();
     var desc = (sheet.querySelector("#editSplitDesc").value || "").trim();
     var notes = sheet.querySelector("#editSplitNotes").value;
+    var total = round2(parseFloat(sheet.querySelector("#editSplitAmount").value) || 0);
 
-    var amountInputs = Array.prototype.slice.call(sheet.querySelectorAll("[data-edit-split-amount]"));
-    var invalid = amountInputs.some(function (inp) { return !(round2(parseFloat(inp.value) || 0) > 0); });
-    if (invalid) { showToast("Every leg needs an amount greater than 0."); return; }
+    var visibleRows = Array.prototype.filter.call(sheet.querySelectorAll("[data-edit-split-row]"), function (row) {
+      return row.style.display !== "none";
+    });
+    // Every leg that already existed must stay filled in (there's no
+    // "remove a leg" control here) - only a freshly added, still-empty
+    // slot is allowed to have nothing in it.
+    var invalidExisting = visibleRows.some(function (row) {
+      var amtInput = row.querySelector("[data-edit-split-amount]");
+      return amtInput.getAttribute("data-existing") === "1" && !(round2(parseFloat(amtInput.value) || 0) > 0);
+    });
+    if (invalidExisting) { showToast("Every existing leg needs an amount greater than 0."); return; }
+    var sum = visibleRows.reduce(function (s, row) { return s + round2(parseFloat(row.querySelector("[data-edit-split-amount]").value) || 0); }, 0);
+    if (Math.abs(round2(sum - total)) > 0.004) { showToast("Leg amounts must add up to the total."); return; }
 
     var toAccountId = null, toBucketId = null;
     if (isPayout) {
@@ -2614,27 +2659,47 @@
 
     var byId = {};
     rows.forEach(function (tx) { byId[tx.id] = tx; });
+    var now = Date.now();
+    var newCount = 0;
 
-    amountInputs.forEach(function (inp) {
-      var tx = byId[inp.getAttribute("data-row-id")];
-      if (!tx) return;
-      tx.amount = round2(parseFloat(inp.value) || 0);
+    visibleRows.forEach(function (row) {
+      var amtInput = row.querySelector("[data-edit-split-amount]");
+      var amount = round2(parseFloat(amtInput.value) || 0);
+      if (!(amount > 0)) return; // an untouched "add another" slot
+      var rowId = amtInput.getAttribute("data-row-id");
+      var selectEl = row.querySelector("[data-edit-split-bucket], [data-edit-split-account]");
+      var selectVal = selectEl.value;
+      var tx = byId[rowId];
+
+      if (!tx) {
+        tx = {
+          id: uid(), type: isPayout ? "payout" : "expense",
+          createdAt: now + (newCount++), updatedAt: now,
+          // Both dimensions leave bucketId shared across every leg except
+          // when the split itself varies by bucket - set the shared value
+          // up front so an account-dimension new leg (which never touches
+          // bucketId below) still gets it.
+          bucketId: rows[0].bucketId
+        };
+        if (!isPayout) { tx.affectsBucket = true; tx.affectsAccount = true; }
+        tx.splitGroupId = groupId;
+        state.transactions.push(tx);
+      }
+      tx.amount = amount;
       tx.date = date;
       tx.description = desc || (isPayout ? "Payout" : "Expense");
       tx.notes = notes;
-      tx.updatedAt = Date.now();
+      tx.updatedAt = now;
       if (isPayout) { tx.toAccountId = toAccountId; tx.toBucketId = toBucketId; }
-    });
-    Array.prototype.forEach.call(sheet.querySelectorAll("[data-edit-split-bucket]"), function (sel) {
-      var tx = byId[sel.getAttribute("data-row-id")];
-      if (!tx) return;
-      tx.bucketId = sel.value;
-      if (isPayout) tx.fromAccountId = effectiveBucketAccountId(bucketById(sel.value));
-    });
-    Array.prototype.forEach.call(sheet.querySelectorAll("[data-edit-split-account]"), function (sel) {
-      var tx = byId[sel.getAttribute("data-row-id")];
-      if (!tx) return;
-      if (isPayout) tx.fromAccountId = sel.value; else tx.accountId = sel.value;
+
+      if (dim === "bucket") {
+        tx.bucketId = selectVal;
+        if (isPayout) tx.fromAccountId = effectiveBucketAccountId(bucketById(selectVal));
+      } else if (isPayout) {
+        tx.fromAccountId = selectVal;
+      } else {
+        tx.accountId = selectVal;
+      }
     });
 
     persist();
