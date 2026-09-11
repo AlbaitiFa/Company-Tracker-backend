@@ -375,20 +375,25 @@
   .filter-badge { font-size: 0.65rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--accent); background: var(--accent-soft); padding: 1px 6px; border-radius: 999px; }
   .ledger-list { display: flex; flex-direction: column; gap: 8px; }
   .ledger-item { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 11px 13px; }
-  /* Legs of one split transaction (same splitGroupId) stacked directly on
-     top of each other, like a hand of cards - each is still the exact same
-     independent .ledger-item card (own Edit/Delete), just overlapped. The
-     front (topmost) card sits narrower than the ones behind it, so each
-     card behind peeks out only on its right edge - where the amount lives
-     - instead of being fully hidden. Height is set in JS (sizeSplitStack)
-     since children are position:absolute and can't size the container
-     themselves, and heights vary slightly between legs (a floor/cascade
-     note might appear on one leg but not another).
-     Clicking a card (wireSplitStacks) brings it to the front. */
+  /* Legs of one split transaction (same splitGroupId): one is "focused"
+     (a full, normal .ledger-item - own Edit/Delete, not itself clickable
+     or hoverable as a stacking control) with a "Split i/N" badge chip.
+     Order is fixed at creation order and never reshuffles. Whatever comes
+     BEFORE the focused leg shows only as a blank sliver (nothing to see,
+     already stepped past); whatever comes AFTER shows as one combined
+     edge with the TOTAL of those legs' amounts, not each one's own -
+     clicking either edge steps focus one leg in that direction. Sizes are
+     set in JS (sizeSplitStacks) against the stack's real measured width. */
   .split-card-stack { position: relative; }
-  .split-stack-card { position: absolute; top: 0; left: 0; transition: transform 0.15s ease; }
-  .split-stack-card .ledger-item { cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,0.25); }
-  .split-stack-card:hover { transform: translateY(-2px); }
+  .split-stack-focus { position: absolute; top: 0; }
+  .split-stack-rest {
+    position: absolute; top: 0; cursor: pointer; transition: transform 0.15s ease;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+  }
+  .split-stack-rest-after { display: flex; align-items: flex-start; justify-content: flex-end; padding: 11px 13px; box-sizing: border-box; }
+  .split-stack-rest:hover { transform: translateY(-2px); }
+  .split-chip { background: var(--surface-2); color: var(--text-muted); font-weight: 600; }
   .ledger-top { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
   .ledger-top > div:first-child { min-width: 0; }
   .ledger-desc { font-size: 0.88rem; font-weight: 600; overflow-wrap: break-word; word-break: break-word; }
@@ -2145,39 +2150,57 @@
     return out;
   }
 
-  // Which leg is currently on top of each split stack - UI-only (like
-  // tourSeen or ledgerFilters), keyed by splitGroupId, not persisted or
-  // synced. Defaults to the first leg until the user clicks another one
-  // to the front.
-  var splitStackFront = {};
-  var SPLIT_STACK_PEEK = 120;
+  // Which leg is currently "focused" (shown in full) in each split stack -
+  // UI-only (like tourSeen or ledgerFilters), keyed by splitGroupId, not
+  // persisted or synced. Defaults to the first leg in CREATION order.
+  // Order never reshuffles - only which leg is focused changes, stepped
+  // via the plain "rest" edges on either side (never the focused card
+  // itself, which isn't a stacking control - it's just a normal entry).
+  var splitStackFocus = {};
+  var SPLIT_STACK_LEFT_WIDTH = 14;
+  var SPLIT_STACK_RIGHT_WIDTH = 112;
+  var SPLIT_STACK_MIN_FOCUS_WIDTH = 180;
 
   function renderSplitLedgerGroup(rows) {
     var groupId = rows[0].splitGroupId;
-    var ordered = rows.slice();
-    var frontId = splitStackFront[groupId];
-    if (frontId) {
-      var frontIdx = ordered.findIndex(function (r) { return r.id === frontId; });
-      if (frontIdx > 0) ordered.unshift(ordered.splice(frontIdx, 1)[0]);
-    }
-    var n = ordered.length;
-    // Width is set for real in wireSplitStacks, against the container's
-    // actual measured pixel width - a CSS-only guess (100% minus a fixed
-    // px peek per card) can't know that width up front, and on a narrow
-    // phone screen the front card's width floors out before the back
-    // cards' do, collapsing the gap between them and cutting off a middle
-    // card's amount. z-index doesn't depend on measured layout, so it's
-    // still set here.
-    var cards = ordered.map(function (tx, i) {
-      var z = n - i;
-      return '<div class="split-stack-card" style="z-index:' + z + '" data-tx-id="' + tx.id + '" data-split-group="' + groupId + '">' +
-        renderLedgerItem(tx) +
-      '</div>';
-    }).join("");
-    return '<div class="split-card-stack" data-split-group="' + groupId + '">' + cards + '</div>';
-  }
+    var stable = rows.slice().sort(function (a, b) { return (a.createdAt || 0) - (b.createdAt || 0); });
+    var n = stable.length;
+    var focusId = splitStackFocus[groupId];
+    var focusIndex = focusId ? stable.findIndex(function (r) { return r.id === focusId; }) : 0;
+    if (focusIndex < 0) focusIndex = 0;
+    var focusedTx = stable[focusIndex];
 
-  var SPLIT_STACK_MIN_FRONT_WIDTH = 190;
+    var isOut = focusedTx.type === "expense" || focusedTx.type === "payout";
+    var isIn = focusedTx.type === "income" || focusedTx.type === "opening_balance";
+    var amtClass = isIn ? "pos" : (isOut ? "neg" : "");
+    var sign = isIn ? "+" : (isOut ? "−" : "");
+
+    function sumRange(fromIdx, toIdx) {
+      var s = 0;
+      for (var k = fromIdx; k <= toIdx; k++) s += Number(stable[k].amount) || 0;
+      return s;
+    }
+
+    // A blank sliver for whatever comes before the focused leg (nothing to
+    // show - it's just been stepped past) and one combined "rest" edge for
+    // whatever comes after (the TOTAL of those legs, not each one's own
+    // amount) - not a cascade of individual peeks, so this never runs into
+    // the old bug where a narrow screen collapses the gap between peeks.
+    var beforeHtml = focusIndex > 0
+      ? '<div class="split-stack-rest split-stack-rest-before" data-step="prev" data-split-group="' + groupId + '"></div>'
+      : "";
+    var afterHtml = focusIndex < n - 1
+      ? '<div class="split-stack-rest split-stack-rest-after" data-step="next" data-split-group="' + groupId + '">' +
+          '<div class="ledger-amt num ' + amtClass + '">' + curr() + ' ' + sign + fmt(sumRange(focusIndex + 1, n - 1)) + '</div>' +
+        '</div>'
+      : "";
+    var focusedHtml = '<div class="split-stack-focus">' + renderLedgerItem(focusedTx, (focusIndex + 1) + "/" + n) + '</div>';
+    var orderIds = stable.map(function (tx) { return tx.id; }).join(",");
+
+    return '<div class="split-card-stack" data-split-group="' + groupId + '" data-focus-index="' + focusIndex + '" data-order="' + orderIds + '">' +
+      beforeHtml + focusedHtml + afterHtml +
+    '</div>';
+  }
 
   // Sizes every split stack in wrap against its REAL current width - split
   // out from wireSplitStacks (which also attaches click listeners, only
@@ -2185,46 +2208,34 @@
   // re-measure on rotate/resize without piling up duplicate listeners.
   function sizeSplitStacks(wrap) {
     Array.prototype.forEach.call(wrap.querySelectorAll(".split-card-stack"), function (stack) {
-      var cards = Array.prototype.slice.call(stack.querySelectorAll(".split-stack-card"));
-      var n = cards.length;
-      // Derive the peek from the container's REAL width so cards never
-      // overlap past their intended edge: the front card can't shrink
-      // below a readable minimum, so on a narrow screen the peek between
-      // EVERY adjacent pair shrinks together (never independently), which
-      // is what keeps each card's amount fully clear of the one in front
-      // of it instead of one gap collapsing while others stay full-size.
-      var containerWidth = stack.clientWidth || SPLIT_STACK_MIN_FRONT_WIDTH;
-      var minFront = Math.min(SPLIT_STACK_MIN_FRONT_WIDTH, containerWidth);
-      var peek = n > 1 ? Math.min(SPLIT_STACK_PEEK, (containerWidth - minFront) / (n - 1)) : 0;
-      var frontWidth = containerWidth - peek * (n - 1);
-      // Only the front (topmost, index 0) card shows in full and sets the
-      // stack's height. Every card behind it is clipped down to just its
-      // own top row - where its amount lives - so what peeks out from
-      // under the front card is ALWAYS only the amount, never a stray
-      // line of notes or a second set of Edit/Delete links, regardless of
-      // how much taller or shorter that leg's own content happens to be.
-      cards.forEach(function (card, i) {
-        card.style.width = (frontWidth + peek * i) + "px";
-        if (i === 0) {
-          stack.style.height = card.offsetHeight + "px";
-        } else {
-          var top = card.querySelector(".ledger-top");
-          var item = card.querySelector(".ledger-item");
-          var vPad = item ? (parseFloat(getComputedStyle(item).paddingTop) + parseFloat(getComputedStyle(item).paddingBottom)) : 0;
-          card.style.maxHeight = ((top ? top.offsetHeight : 0) + vPad) + "px";
-          card.style.overflow = "hidden";
-        }
-      });
+      var containerWidth = stack.clientWidth || SPLIT_STACK_MIN_FOCUS_WIDTH;
+      var before = stack.querySelector(".split-stack-rest-before");
+      var after = stack.querySelector(".split-stack-rest-after");
+      var focus = stack.querySelector(".split-stack-focus");
+      var leftW = before ? SPLIT_STACK_LEFT_WIDTH : 0;
+      var rightW = after ? Math.min(SPLIT_STACK_RIGHT_WIDTH, Math.max(0, containerWidth - SPLIT_STACK_MIN_FOCUS_WIDTH - leftW)) : 0;
+      var focusW = Math.max(SPLIT_STACK_MIN_FOCUS_WIDTH, containerWidth - leftW - rightW);
+      if (before) { before.style.left = "0px"; before.style.width = leftW + "px"; }
+      if (focus) { focus.style.left = leftW + "px"; focus.style.width = focusW + "px"; }
+      if (after) { after.style.left = (leftW + focusW) + "px"; after.style.width = rightW + "px"; }
+      var h = focus ? focus.offsetHeight : 0;
+      stack.style.height = h + "px";
+      if (before) before.style.height = h + "px";
+      if (after) after.style.height = h + "px";
     });
   }
 
   function wireSplitStacks(wrap) {
     sizeSplitStacks(wrap);
-    Array.prototype.forEach.call(wrap.querySelectorAll(".split-stack-card"), function (card) {
-      var groupId = card.getAttribute("data-split-group");
-      card.addEventListener("click", function (e) {
-        if (e.target.closest("button")) return; // let Edit/Delete work normally
-        splitStackFront[groupId] = card.getAttribute("data-tx-id");
+    Array.prototype.forEach.call(wrap.querySelectorAll(".split-stack-rest"), function (el) {
+      el.addEventListener("click", function () {
+        var stack = el.closest(".split-card-stack");
+        var groupId = el.getAttribute("data-split-group");
+        var order = stack.getAttribute("data-order").split(",");
+        var focusIndex = parseInt(stack.getAttribute("data-focus-index"), 10);
+        var step = el.getAttribute("data-step") === "next" ? 1 : -1;
+        var newIndex = Math.max(0, Math.min(order.length - 1, focusIndex + step));
+        splitStackFocus[groupId] = order[newIndex];
         renderLedgerList();
       });
     });
@@ -2267,7 +2278,7 @@
     renderLedgerList();
   }
 
-  function renderLedgerItem(tx) {
+  function renderLedgerItem(tx, splitBadge) {
     var isOut = tx.type === "expense" || tx.type === "payout";
     var isIn = tx.type === "income" || tx.type === "opening_balance";
     var amtClass = isIn ? "pos" : (isOut ? "neg" : "");
@@ -2326,6 +2337,11 @@
         return '<span class="chip" style="--chip-soft:var(--' + hue3 + '-soft);--chip-color:var(--' + hue3 + ')">' + esc(b3.name) + ' ' + fmt(tx.allocation[bid]) + '</span>';
       }).join("") + '</div>';
       note = "Into " + (acct3 ? esc(acct3.name) : "(deleted account)") + " · not counted as Real Revenue";
+    }
+
+    if (splitBadge) {
+      var badgeChip = '<span class="chip split-chip">Split ' + esc(splitBadge) + '</span>';
+      chips = chips ? chips.replace(/<\/div>\s*$/, badgeChip + "</div>") : ('<div class="chip-row">' + badgeChip + '</div>');
     }
 
     var actions = tx.type === "opening_balance" ? "" : '<button class="link-btn" data-action="edit" data-id="' + tx.id + '">Edit</button>';
@@ -3044,7 +3060,7 @@
         expSplit.rows.forEach(function (row, i) {
           state.transactions.push({
             id: uid(), type: "expense", date: date,
-            description: (desc || "Expense") + " — split " + (i + 1) + "/" + expSplit.rows.length,
+            description: desc || "Expense",
             notes: notes, amount: row.amount, bucketId: expenseBucketId, accountId: row.accountId,
             affectsBucket: true, affectsAccount: true, historical: expHistorical,
             splitGroupId: expSplitGroupId, createdAt: expSplitNow + i
@@ -3087,7 +3103,7 @@
         paySplit.rows.forEach(function (row, i) {
           state.transactions.push({
             id: uid(), type: "payout", date: date,
-            description: (desc || "Payout") + " — split " + (i + 1) + "/" + paySplit.rows.length,
+            description: desc || "Payout",
             notes: notes, amount: row.amount, bucketId: payoutBucketId,
             toAccountId: paySplitToAccountId, toBucketId: paySplitToBucketId, fromAccountId: row.accountId,
             splitGroupId: paySplitGroupId, createdAt: paySplitNow + i
@@ -3111,7 +3127,7 @@
         bucketSplit.rows.forEach(function (row, i) {
           state.transactions.push({
             id: uid(), type: "payout", date: date,
-            description: (desc || "Payout") + " — split " + (i + 1) + "/" + bucketSplit.rows.length,
+            description: desc || "Payout",
             notes: notes, amount: row.amount, bucketId: row.bucketId,
             toAccountId: bsToAccountId, toBucketId: bsToBucketId,
             fromAccountId: effectiveBucketAccountId(bucketById(row.bucketId)),
