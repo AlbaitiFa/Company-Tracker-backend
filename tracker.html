@@ -378,15 +378,14 @@
   /* Legs of one split transaction (same splitGroupId): one is "focused"
      (a full, normal .ledger-item - own Edit/Delete) with an "i/N" corner
      badge. Order is fixed at creation order and never reshuffles - only
-     which leg is focused changes. EVERY other leg gets its own peeking
-     "rest" card showing its own amount (not blanked out, not combined
-     into a total) - cascading outward on whichever side it actually sits
-     relative to focus, each one tucked partly under the one closer to
-     focus (z-index lower going outward), all at the SAME height as the
-     focused card so every amount lines up at the ordinary top position.
-     Clicking a rest card jumps focus directly to that leg. Sizes/
-     positions are set in JS (sizeSplitStacks) against the stack's real
-     measured width - see there for the cascade math. */
+     which leg is focused changes. EVERY other leg gets its own plain
+     stacked edge (no amount preview, just the visual cue a card is there)
+     cascading outward on whichever side it actually sits relative to
+     focus, each one tucked partly under the one closer to focus (z-index
+     lower going outward), all at the SAME height as the focused card.
+     Clicking an edge jumps focus directly to that leg. Sizes/positions
+     are set in JS (sizeSplitStacks) against the stack's real measured
+     width - see there for the cascade math. */
   .split-card-stack { position: relative; }
   .split-stack-focus { position: absolute; top: 0; z-index: 100; }
   .split-stack-rest {
@@ -394,10 +393,7 @@
     background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
     box-shadow: 0 3px 10px rgba(0,0,0,0.22);
     box-sizing: border-box;
-    display: flex; align-items: flex-start; padding: 11px 13px;
   }
-  .split-stack-rest-before { justify-content: flex-start; }
-  .split-stack-rest-after { justify-content: flex-end; }
   .split-corner-badge {
     font-family: var(--font-mono); font-size: 0.68rem; font-weight: 600;
     color: var(--text-muted); background: var(--surface-2);
@@ -2189,7 +2185,7 @@
   // clicking directly on any other leg's own peeking card (never the
   // focused card itself, which isn't a stacking control).
   var splitStackFocus = {};
-  var SPLIT_STACK_PEEK = 92;
+  var SPLIT_STACK_PEEK = 12;
   var SPLIT_STACK_UNDERLAP = 18;
   var SPLIT_STACK_MIN_FOCUS_WIDTH = 170;
 
@@ -2202,18 +2198,13 @@
     if (focusIndex < 0) focusIndex = 0;
     var focusedTx = stable[focusIndex];
 
-    // Every OTHER leg gets its own peeking card (own amount, not a blank
-    // sliver and not combined into one total) - cascading further out the
-    // more legs sit between it and focus. data-distance (1 = right next
-    // to focus) is what sizeSplitStacks uses to place and z-order them.
+    // Every OTHER leg gets its own plain stacked edge (no amount preview -
+    // just the visual cue that there's a card there) cascading further out
+    // the more legs sit between it and focus. data-distance (1 = right
+    // next to focus) is what sizeSplitStacks uses to place and z-order
+    // them. Still clickable - jumps focus straight to that leg.
     function peekCardHtml(tx, side, distance) {
-      var isOut = tx.type === "expense" || tx.type === "payout";
-      var isIn = tx.type === "income" || tx.type === "opening_balance";
-      var amtClass = isIn ? "pos" : (isOut ? "neg" : "");
-      var sign = isIn ? "+" : (isOut ? "−" : "");
-      return '<div class="split-stack-rest split-stack-rest-' + side + '" data-tx-id="' + tx.id + '" data-split-group="' + groupId + '" data-distance="' + distance + '">' +
-        '<div class="ledger-amt num ' + amtClass + '">' + curr() + ' ' + sign + fmt(tx.amount) + '</div>' +
-      '</div>';
+      return '<div class="split-stack-rest split-stack-rest-' + side + '" data-tx-id="' + tx.id + '" data-split-group="' + groupId + '" data-distance="' + distance + '"></div>';
     }
 
     var beforeHtml = "";
