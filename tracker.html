@@ -375,6 +375,11 @@
   .filter-badge { font-size: 0.65rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--accent); background: var(--accent-soft); padding: 1px 6px; border-radius: 999px; }
   .ledger-list { display: flex; flex-direction: column; gap: 8px; }
   .ledger-item { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 11px 13px; }
+  /* Legs of one split transaction (same splitGroupId) rendered side by
+     side instead of stacked - each is still the exact same independent
+     .ledger-item card (own Edit/Delete), just laid out in a row. */
+  .split-card-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .split-card-row > .ledger-item { flex: 1 1 45%; min-width: 150px; }
   .ledger-top { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
   .ledger-top > div:first-child { min-width: 0; }
   .ledger-desc { font-size: 0.88rem; font-weight: 600; overflow-wrap: break-word; word-break: break-word; }
@@ -2105,6 +2110,34 @@
       renderLedger();
     });
   }
+  // A split transaction (multiple accounts, or multiple buckets, for one
+  // payout/expense) is still N ordinary transactions underneath -
+  // computeDerived(), edit/delete, filtering all work on them exactly as if
+  // they were unrelated entries, each with its own Edit/Delete. This only
+  // groups ADJACENT rows sharing a splitGroupId for LAYOUT - rendered side
+  // by side in one row instead of stacked. A sort where they land next to
+  // each other (date sort - the common case, since they share a date and
+  // near-identical createdAt) puts them in one row; under amount sort they
+  // can land apart and just render individually - no special-casing needed
+  // since grouping only combines rows already adjacent in the given order.
+  function groupAdjacentLedgerSplits(list) {
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      var tx = list[i];
+      if (tx.splitGroupId) {
+        var group = [tx];
+        while (i + 1 < list.length && list[i + 1].splitGroupId === tx.splitGroupId) { group.push(list[++i]); }
+        out.push(group.length > 1 ? { kind: "split", rows: group } : { kind: "single", tx: tx });
+      } else {
+        out.push({ kind: "single", tx: tx });
+      }
+    }
+    return out;
+  }
+  function renderSplitLedgerGroup(rows) {
+    return '<div class="split-card-row">' + rows.map(renderLedgerItem).join("") + '</div>';
+  }
+
   function renderLedgerList() {
     var wrap = document.getElementById("ledgerListWrap");
     if (!wrap) return;
@@ -2124,7 +2157,10 @@
       wrap.innerHTML = '<div class="empty-state">No transactions match your filters.</div>';
       return;
     }
-    wrap.innerHTML = '<div class="ledger-list">' + filtered.map(renderLedgerItem).join("") + '</div>';
+    var groups = groupAdjacentLedgerSplits(filtered);
+    wrap.innerHTML = '<div class="ledger-list">' + groups.map(function (g) {
+      return g.kind === "split" ? renderSplitLedgerGroup(g.rows) : renderLedgerItem(g.tx);
+    }).join("") + '</div>';
   }
   function renderLedger() {
     var el = document.getElementById("ledgerSection");
@@ -2343,7 +2379,7 @@
     );
   }
 
-  function wireSplitSection(sheet, prefix, otherDiffToggleSelector) {
+  function wireSplitSection(sheet, prefix, otherDiffToggleSelectors) {
     var toggle = sheet.querySelector("#f" + prefix + "Split");
     var wrap = sheet.querySelector("#f" + prefix + "SplitWrap");
     if (!toggle || !wrap) return;
@@ -2351,6 +2387,7 @@
     var addBtn = sheet.querySelector("#f" + prefix + "SplitAddRow");
     var remainingEl = sheet.querySelector("#f" + prefix + "SplitRemaining");
     var rows = Array.prototype.slice.call(sheet.querySelectorAll("[data-split-row]"));
+    var otherSelectors = [].concat(otherDiffToggleSelectors || []);
 
     function updateRemaining() {
       var total = round2(parseFloat(amountInput.value) || 0);
@@ -2375,11 +2412,13 @@
 
     toggle.addEventListener("change", function () {
       wrap.style.display = toggle.checked ? "" : "none";
-      var otherToggle = otherDiffToggleSelector ? sheet.querySelector(otherDiffToggleSelector) : null;
-      if (toggle.checked && otherToggle && otherToggle.checked) {
-        otherToggle.checked = false;
-        otherToggle.dispatchEvent(new Event("change", { bubbles: true }));
-      }
+      otherSelectors.forEach(function (sel) {
+        var otherToggle = sheet.querySelector(sel);
+        if (toggle.checked && otherToggle && otherToggle.checked) {
+          otherToggle.checked = false;
+          otherToggle.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+      });
       updateRemaining();
     });
     amountInput.addEventListener("input", updateRemaining);
@@ -2407,6 +2446,111 @@
       var amt = round2(parseFloat(row.querySelector('input[type="number"]').value) || 0);
       if (amt > 0) {
         result.push({ accountId: accountId, amount: amt });
+        sum += amt;
+      }
+    });
+    var diff = round2(sum - totalAmount);
+    return { rows: result, valid: result.length >= 2 && Math.abs(diff) <= 0.004 };
+  }
+
+  // Split a payout's SOURCE across two or more buckets in one go (e.g. a
+  // vendor invoice funded partly from Opex, partly from Profit) - mirrors
+  // splitAccountsSectionHtml/wireSplitSection/readSplitRows above but keyed
+  // by bucket instead of account, and kept as its own set of functions
+  // rather than folded into those: the two features toggle mutually
+  // exclusive UI (this hides the single "From bucket" field entirely,
+  // since each row picks its own), so sharing one row-parsing path would
+  // just add branching without saving real code.
+  function splitBucketsSectionHtml(prefix, defaultBucketId) {
+    var rowsHtml = "";
+    for (var i = 0; i < SPLIT_ROW_COUNT; i++) {
+      rowsHtml += '<div class="row2 split-bucket-row" data-split-bucket-row="' + i + '"' + (i >= 2 ? ' style="display:none"' : '') + '>' +
+        '<div class="field"><label>Bucket</label><select class="select" id="f' + prefix + 'SplitBucket' + i + '">' + bucketOptions(i === 0 ? defaultBucketId : null) + '</select></div>' +
+        '<div class="field"><label>Amount</label><input class="input" type="number" step="0.01" min="0" id="f' + prefix + 'SplitBucketAmount' + i + '" placeholder="0.00"></div>' +
+      '</div>';
+    }
+    return (
+      '<label class="check-row"><input type="checkbox" id="f' + prefix + 'BucketSplit"> Split across buckets</label><div class="check-note">Fund this payout from two or more buckets at once — it shows as one grouped entry in the ledger.</div>' +
+      '<div id="f' + prefix + 'BucketSplitWrap" style="display:none">' +
+        rowsHtml +
+        '<button type="button" class="link-btn" id="f' + prefix + 'BucketSplitAddRow">+ Add another bucket</button>' +
+        '<div class="split-remaining" id="f' + prefix + 'BucketSplitRemaining"></div>' +
+      '</div>'
+    );
+  }
+
+  function wireBucketSplitSection(sheet, prefix, otherToggleSelectors) {
+    var toggle = sheet.querySelector("#f" + prefix + "BucketSplit");
+    var wrap = sheet.querySelector("#f" + prefix + "BucketSplitWrap");
+    if (!toggle || !wrap) return;
+    var amountInput = sheet.querySelector("#fAmount");
+    var addBtn = sheet.querySelector("#f" + prefix + "BucketSplitAddRow");
+    var remainingEl = sheet.querySelector("#f" + prefix + "BucketSplitRemaining");
+    var rows = Array.prototype.slice.call(sheet.querySelectorAll("[data-split-bucket-row]"));
+    var otherSelectors = [].concat(otherToggleSelectors || []);
+    var fromBucketField = sheet.querySelector("#fBucket");
+    var fromBucketWrap = fromBucketField ? fromBucketField.closest(".field") : null;
+    var fromCaption = sheet.querySelector("#fFromCaption");
+
+    function updateRemaining() {
+      var total = round2(parseFloat(amountInput.value) || 0);
+      var sum = 0;
+      rows.forEach(function (row) {
+        if (row.style.display === "none") return;
+        sum += round2(parseFloat(row.querySelector('input[type="number"]').value) || 0);
+      });
+      var remaining = round2(total - sum);
+      if (!remainingEl) return;
+      if (Math.abs(remaining) <= 0.004) {
+        remainingEl.textContent = "Fully allocated.";
+        remainingEl.className = "split-remaining ok";
+      } else if (remaining > 0) {
+        remainingEl.textContent = fmt(remaining) + " left to allocate.";
+        remainingEl.className = "split-remaining bad";
+      } else {
+        remainingEl.textContent = fmt(Math.abs(remaining)) + " over the total amount.";
+        remainingEl.className = "split-remaining bad";
+      }
+    }
+
+    toggle.addEventListener("change", function () {
+      wrap.style.display = toggle.checked ? "" : "none";
+      if (fromBucketWrap) fromBucketWrap.style.display = toggle.checked ? "none" : "";
+      if (fromCaption) fromCaption.style.display = toggle.checked ? "none" : "";
+      otherSelectors.forEach(function (sel) {
+        var otherToggle = sheet.querySelector(sel);
+        if (toggle.checked && otherToggle && otherToggle.checked) {
+          otherToggle.checked = false;
+          otherToggle.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+      });
+      updateRemaining();
+    });
+    amountInput.addEventListener("input", updateRemaining);
+    rows.forEach(function (row) {
+      row.querySelector('input[type="number"]').addEventListener("input", updateRemaining);
+    });
+    if (addBtn) {
+      addBtn.addEventListener("click", function () {
+        var hiddenRow = rows.find(function (r) { return r.style.display === "none"; });
+        if (hiddenRow) hiddenRow.style.display = "";
+        if (!rows.some(function (r) { return r.style.display === "none"; })) addBtn.style.display = "none";
+        updateRemaining();
+      });
+    }
+    updateRemaining();
+  }
+
+  function readSplitBucketRows(sheet, totalAmount) {
+    var rows = sheet.querySelectorAll("[data-split-bucket-row]");
+    var result = [];
+    var sum = 0;
+    rows.forEach(function (row) {
+      if (row.style.display === "none") return;
+      var bucketId = row.querySelector("select").value;
+      var amt = round2(parseFloat(row.querySelector('input[type="number"]').value) || 0);
+      if (amt > 0) {
+        result.push({ bucketId: bucketId, amount: amt });
         sum += amt;
       }
     });
@@ -2550,6 +2694,7 @@
         '<div id="fPayoutDiffAccountWrap" class="field" style="display:' + (payoutDiffAccount ? "" : "none") + '"><label>Account</label><select class="select" id="fFromAccount">' + accountOptions(payoutFromAcctId) + '</select></div>' +
         (editingTx ? "" :
           splitAccountsSectionHtml("Payout", effAcct0 ? effAcct0.id : null) +
+          splitBucketsSectionHtml("Payout", payoutBucket0 ? payoutBucket0.id : null) +
           '<label class="check-row"><input type="checkbox" id="fFee"> Deduct fee</label>' +
           '<div id="fFeeWrap" style="display:none">' +
             '<div class="row2">' +
@@ -2610,7 +2755,10 @@
     wireTxSheetChrome();
 
     if (txTab === "expense") wireSplitSection(sheet, "Expense", "#fDiffAccount");
-    if (txTab === "payout") wireSplitSection(sheet, "Payout", "#fPayoutDiffAccount");
+    if (txTab === "payout") {
+      wireSplitSection(sheet, "Payout", ["#fPayoutDiffAccount", "#fPayoutBucketSplit"]);
+      wireBucketSplitSection(sheet, "Payout", ["#fPayoutDiffAccount", "#fPayoutSplit"]);
+    }
 
     var amountInput = sheet.querySelector("#fAmount");
     var materialsInput = sheet.querySelector("#fMaterials");
@@ -2644,11 +2792,13 @@
     if (payoutDiffAccountToggle) {
       payoutDiffAccountToggle.addEventListener("change", function () {
         document.getElementById("fPayoutDiffAccountWrap").style.display = payoutDiffAccountToggle.checked ? "" : "none";
-        var splitToggle = sheet.querySelector("#fPayoutSplit");
-        if (payoutDiffAccountToggle.checked && splitToggle && splitToggle.checked) {
-          splitToggle.checked = false;
-          splitToggle.dispatchEvent(new Event("change", { bubbles: true }));
-        }
+        ["#fPayoutSplit", "#fPayoutBucketSplit"].forEach(function (sel) {
+          var otherToggle = sheet.querySelector(sel);
+          if (payoutDiffAccountToggle.checked && otherToggle && otherToggle.checked) {
+            otherToggle.checked = false;
+            otherToggle.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+        });
       });
     }
     var feeToggle = sheet.querySelector("#fFee");
@@ -2797,12 +2947,14 @@
         var expSplit = readSplitRows(sheet, "Expense", amount);
         if (!expSplit.valid) { showToast("Split amounts must add up to the total, across at least 2 accounts."); return; }
         var expSplitNow = Date.now();
+        var expSplitGroupId = uid();
         expSplit.rows.forEach(function (row, i) {
           state.transactions.push({
             id: uid(), type: "expense", date: date,
             description: (desc || "Expense") + " — split " + (i + 1) + "/" + expSplit.rows.length,
             notes: notes, amount: row.amount, bucketId: expenseBucketId, accountId: row.accountId,
-            affectsBucket: true, affectsAccount: true, historical: expHistorical, createdAt: expSplitNow + i
+            affectsBucket: true, affectsAccount: true, historical: expHistorical,
+            splitGroupId: expSplitGroupId, createdAt: expSplitNow + i
           });
         });
         persist();
@@ -2838,19 +2990,45 @@
         if (destRaw0.indexOf("account:") === 0) paySplitToAccountId = destRaw0.slice(8);
         else if (destRaw0.indexOf("bucket:") === 0) { paySplitToBucketId = destRaw0.slice(7); paySplitToAccountId = effectiveBucketAccountId(bucketById(paySplitToBucketId)); }
         var paySplitNow = Date.now();
+        var paySplitGroupId = uid();
         paySplit.rows.forEach(function (row, i) {
           state.transactions.push({
             id: uid(), type: "payout", date: date,
             description: (desc || "Payout") + " — split " + (i + 1) + "/" + paySplit.rows.length,
             notes: notes, amount: row.amount, bucketId: payoutBucketId,
             toAccountId: paySplitToAccountId, toBucketId: paySplitToBucketId, fromAccountId: row.accountId,
-            createdAt: paySplitNow + i
+            splitGroupId: paySplitGroupId, createdAt: paySplitNow + i
           });
         });
         persist();
         closeTxSheet();
         render();
         showToast("Payout split across " + paySplit.rows.length + " accounts.");
+        return;
+      }
+      var payoutBucketSplitToggle = sheet.querySelector("#fPayoutBucketSplit");
+      if (!editingTx && payoutBucketSplitToggle && payoutBucketSplitToggle.checked) {
+        var bucketSplit = readSplitBucketRows(sheet, amount);
+        if (!bucketSplit.valid) { showToast("Split amounts must add up to the total, across at least 2 buckets."); return; }
+        var bsToAccountId = null, bsToBucketId = null;
+        if (destRaw0.indexOf("account:") === 0) bsToAccountId = destRaw0.slice(8);
+        else if (destRaw0.indexOf("bucket:") === 0) { bsToBucketId = destRaw0.slice(7); bsToAccountId = effectiveBucketAccountId(bucketById(bsToBucketId)); }
+        var bsGroupId = uid();
+        var bsNow = Date.now();
+        bucketSplit.rows.forEach(function (row, i) {
+          state.transactions.push({
+            id: uid(), type: "payout", date: date,
+            description: (desc || "Payout") + " — split " + (i + 1) + "/" + bucketSplit.rows.length,
+            notes: notes, amount: row.amount, bucketId: row.bucketId,
+            toAccountId: bsToAccountId, toBucketId: bsToBucketId,
+            fromAccountId: effectiveBucketAccountId(bucketById(row.bucketId)),
+            splitGroupId: bsGroupId, createdAt: bsNow + i
+          });
+        });
+        persist();
+        closeTxSheet();
+        render();
+        showToast("Payout split across " + bucketSplit.rows.length + " buckets.");
         return;
       }
       var payoutDiffToggle = sheet.querySelector("#fPayoutDiffAccount");
