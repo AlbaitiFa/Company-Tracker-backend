@@ -386,8 +386,14 @@
      Clicking an edge jumps focus directly to that leg. Sizes/positions
      are set in JS (sizeSplitStacks) against the stack's real measured
      width - see there for the cascade math. */
-  .split-card-stack { position: relative; }
-  .split-stack-focus { position: absolute; top: 0; z-index: 100; }
+  /* isolation:isolate gives this its own stacking context, so the
+     z-indexes inside (however large) only ever compete with each other -
+     never with the sticky header, a modal overlay, or anything else on
+     the page (which is exactly what broke: .split-stack-focus at
+     z-index:100 was floating above the header and even above open
+     modals, since without isolation it was competing globally). */
+  .split-card-stack { position: relative; isolation: isolate; }
+  .split-stack-focus { position: absolute; top: 0; z-index: 10; }
   .split-stack-rest {
     position: absolute; top: 0; cursor: pointer;
     background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
