@@ -352,6 +352,7 @@
   .ledger-floor-note {
     font-size: 0.72rem; color: var(--danger); font-weight: 600; line-height: 1.35; margin-top: 6px;
   }
+  .split-afloat-note { color: var(--gold); font-weight: 600; }
   .bucket-activity {
     font-size: 0.66rem; color: var(--text-muted); line-height: 1.35; margin-top: 1px;
     display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
@@ -668,6 +669,10 @@
 
 <div class="overlay" id="editSplitOverlay">
   <div class="sheet" role="dialog" aria-modal="true" id="editSplitSheet"></div>
+</div>
+
+<div class="overlay" id="distributeTransferOverlay">
+  <div class="sheet" role="dialog" aria-modal="true" id="distributeTransferSheet"></div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -2158,28 +2163,50 @@
       renderLedger();
     });
   }
-  // A split transaction (multiple accounts, or multiple buckets, for one
-  // payout/expense) is still N ordinary transactions underneath -
-  // computeDerived(), edit/delete, filtering all work on them exactly as if
-  // they were unrelated entries, each with its own Edit/Delete. This only
-  // groups ADJACENT rows sharing a splitGroupId for LAYOUT - rendered as a
-  // stack of overlapping cards instead of separate rows. A sort where they
-  // land next to each other (date sort - the common case, since they share
-  // a date and near-identical createdAt) puts them in one stack; under
+  // A split transaction (multiple accounts, for one payout/expense) is
+  // still N ordinary transactions underneath - computeDerived(),
+  // edit/delete, filtering all work on them exactly as if they were
+  // unrelated entries, each with its own Edit/Delete. This only groups
+  // ADJACENT rows sharing a splitGroupId for LAYOUT - rendered as a stack
+  // of overlapping cards instead of separate rows. A sort where they land
+  // next to each other (date sort - the common case, since they share a
+  // date and near-identical createdAt) puts them in one stack; under
   // amount sort they can land apart and just render individually - no
   // special-casing needed since grouping only combines rows already
   // adjacent in the given order.
-  function groupAdjacentLedgerSplits(list) {
+  //
+  // A transfer's distributions are different: they can be added whenever,
+  // long after the transfer itself and with no date/createdAt relation to
+  // it, so they can't rely on adjacency at all. Instead they're matched
+  // by transferId regardless of where they sort, pulled out of their own
+  // position, and shown bundled with the transfer wherever IT sorts - but
+  // only if the transfer is actually present in this same (filtered) list;
+  // otherwise a distribution just falls back to rendering as a normal
+  // single card, so it doesn't vanish under a bucket/account/type filter
+  // that excludes transfers.
+  function groupLedgerRows(list) {
+    var idsInList = {};
+    list.forEach(function (tx) { idsInList[tx.id] = true; });
+    var distributionsByTransfer = {};
+    list.forEach(function (tx) {
+      if (tx.transferId) (distributionsByTransfer[tx.transferId] = distributionsByTransfer[tx.transferId] || []).push(tx);
+    });
+
     var out = [];
     for (var i = 0; i < list.length; i++) {
       var tx = list[i];
+      if (tx.transferId && idsInList[tx.transferId]) continue; // bundled under its transfer below
+      if (tx.type === "transfer" && distributionsByTransfer[tx.id] && distributionsByTransfer[tx.id].length) {
+        out.push({ kind: "transfer-split", transfer: tx, distributions: distributionsByTransfer[tx.id] });
+        continue;
+      }
       if (tx.splitGroupId) {
         var group = [tx];
         while (i + 1 < list.length && list[i + 1].splitGroupId === tx.splitGroupId) { group.push(list[++i]); }
         out.push(group.length > 1 ? { kind: "split", rows: group } : { kind: "single", tx: tx });
-      } else {
-        out.push({ kind: "single", tx: tx });
+        continue;
       }
+      out.push({ kind: "single", tx: tx });
     }
     return out;
   }
@@ -2195,34 +2222,155 @@
   var SPLIT_STACK_UNDERLAP = 18;
   var SPLIT_STACK_MIN_FOCUS_WIDTH = 170;
 
-  function renderSplitLedgerGroup(rows) {
-    var groupId = rows[0].splitGroupId;
-    var stable = rows.slice().sort(function (a, b) { return (a.createdAt || 0) - (b.createdAt || 0); });
-    var n = stable.length;
-    var focusId = splitStackFocus[groupId];
-    var focusIndex = focusId ? stable.findIndex(function (r) { return r.id === focusId; }) : 0;
-    if (focusIndex < 0) focusIndex = 0;
-    var focusedTx = stable[focusIndex];
+  var SPLIT_MASTER_ID = "__master__";
 
-    // Every OTHER leg gets its own plain stacked edge (no amount preview -
-    // just the visual cue that there's a card there) cascading further out
-    // the more legs sit between it and focus. data-distance (1 = right
-    // next to focus) is what sizeSplitStacks uses to place and z-order
-    // them. Still clickable - jumps focus straight to that leg.
-    function peekCardHtml(tx, side, distance) {
-      return '<div class="split-stack-rest split-stack-rest-' + side + '" data-tx-id="' + tx.id + '" data-split-group="' + groupId + '" data-distance="' + distance + '"></div>';
+  // The overview card for a split - total amount, one chip per leg (its
+  // bucket/account + its own amount, same chip styling income's split
+  // already uses), and the destination. Edit/Delete point at leg 0's id
+  // purely as a carrier - the ledger click handler already redirects any
+  // tx with a splitGroupId to the whole-group edit/delete, so it doesn't
+  // matter which leg's id rides along.
+  function renderMasterCard(stable, groupId) {
+    var first = stable[0];
+    var isPayout = first.type === "payout";
+    var total = round2(stable.reduce(function (s, r) { return s + (Number(r.amount) || 0); }, 0));
+    var dim = splitGroupDimension(stable);
+
+    var chips = '<div class="chip-row">' + stable.map(function (tx) {
+      var b = bucketById(tx.bucketId);
+      var a = accountById(dim === "account" ? (isPayout ? tx.fromAccountId : tx.accountId) : null);
+      var label = dim === "bucket" ? (b ? b.name : "?") : (a ? a.name : "?");
+      var hue = dim === "bucket" ? bucketColor(bucketIndex(tx.bucketId)) : null;
+      var style = hue ? ' style="--chip-soft:var(--' + hue + '-soft);--chip-color:var(--' + hue + ')"' : "";
+      return '<span class="chip"' + style + '>' + esc(label) + ' ' + fmt(tx.amount) + '</span>';
+    }).join("") + '</div>';
+
+    var destText = "";
+    if (isPayout) {
+      var toBucket = first.toBucketId ? bucketById(first.toBucketId) : null;
+      var toAcct = first.toAccountId ? accountById(first.toAccountId) : null;
+      destText = " → " + (toBucket ? ("into " + esc(toBucket.name) + " bucket" + (toAcct ? " (" + esc(toAcct.name) + ")" : "")) : (toAcct ? "into " + esc(toAcct.name) : "paid out, not tracked further"));
+    }
+    var note = "Split across " + stable.length + " " + (dim === "bucket" ? "buckets" : "accounts") + destText;
+
+    var actions = '<button class="link-btn" data-action="edit" data-id="' + first.id + '">Edit</button>' +
+      '<button class="link-btn danger" data-action="delete" data-id="' + first.id + '">Delete</button>';
+
+    return (
+      '<div class="ledger-item">' +
+        '<div class="ledger-top">' +
+          '<div><div class="ledger-desc">' + esc(first.description || "(no description)") + '</div><div class="ledger-date">' + esc(first.date) + '</div></div>' +
+          '<div class="ledger-amt num neg">' + curr() + ' −' + fmt(total) + '</div>' +
+        '</div>' +
+        chips +
+        '<div class="ledger-note">' + note + '</div>' +
+        '<div class="ledger-actions">' + actions + '</div>' +
+      '</div>'
+    );
+  }
+
+  // Shared by both split-group and transfer-distribution stacks: a virtual
+  // sequence [master, leg0, leg1, ...] where the master overview sits at
+  // position 0, always the leftmost thing in the stack, reached exactly
+  // like any other leg (clicking its way back into view through the same
+  // peeking edges, no special-cased "back" control). masterHtml is
+  // whatever the caller wants shown when the master position is focused;
+  // legs are rendered through the normal renderLedgerItem with a "i/N"
+  // badge, exactly like any other ledger card.
+  function renderStackedLedgerGroup(groupId, masterHtml, legs) {
+    var n = legs.length;
+    var focusVal = splitStackFocus[groupId];
+    var isMaster = !focusVal || focusVal === SPLIT_MASTER_ID;
+    var legIndex = isMaster ? -1 : legs.findIndex(function (r) { return r.id === focusVal; });
+    if (legIndex < 0) { isMaster = true; legIndex = -1; }
+    var focusVirtualIndex = isMaster ? 0 : legIndex + 1;
+
+    // Every OTHER position gets its own plain stacked edge (no amount
+    // preview - just the visual cue that there's a card there) cascading
+    // further out the more positions sit between it and focus.
+    // data-distance (1 = right next to focus) is what sizeSplitStacks
+    // uses to place and z-order them. Still clickable - jumps focus
+    // straight to that position (a leg, or back to the master overview).
+    function edgeHtml(virtualIndex, side, distance) {
+      var txId = virtualIndex === 0 ? SPLIT_MASTER_ID : legs[virtualIndex - 1].id;
+      return '<div class="split-stack-rest split-stack-rest-' + side + '" data-tx-id="' + txId + '" data-split-group="' + groupId + '" data-distance="' + distance + '"></div>';
     }
 
     var beforeHtml = "";
-    for (var b = 0; b < focusIndex; b++) beforeHtml += peekCardHtml(stable[b], "before", focusIndex - b);
+    for (var b = 0; b < focusVirtualIndex; b++) beforeHtml += edgeHtml(b, "before", focusVirtualIndex - b);
     var afterHtml = "";
-    for (var a = focusIndex + 1; a < n; a++) afterHtml += peekCardHtml(stable[a], "after", a - focusIndex);
+    for (var a = focusVirtualIndex + 1; a <= n; a++) afterHtml += edgeHtml(a, "after", a - focusVirtualIndex);
 
-    var focusedHtml = '<div class="split-stack-focus">' + renderLedgerItem(focusedTx, (focusIndex + 1) + "/" + n) + '</div>';
+    var focusedContent = isMaster ? masterHtml : renderLedgerItem(legs[legIndex], (legIndex + 1) + "/" + n);
+    var focusedHtml = '<div class="split-stack-focus">' + focusedContent + '</div>';
 
     return '<div class="split-card-stack" data-split-group="' + groupId + '">' +
       beforeHtml + focusedHtml + afterHtml +
     '</div>';
+  }
+
+  function renderSplitLedgerGroup(rows) {
+    var groupId = rows[0].splitGroupId;
+    var stable = rows.slice().sort(function (a, b) { return (a.createdAt || 0) - (b.createdAt || 0); });
+    return renderStackedLedgerGroup(groupId, renderMasterCard(stable, groupId), stable);
+  }
+
+  /* ---------------- transfer distributions ----------------
+     A Transfer is the real, bank-verifiable event - money actually moving
+     from one tracked account to another. What that money is FOR
+     internally (which buckets it should count against) is a separate,
+     optional, ADD-WHENEVER layer on top: a "distribution" is a normal
+     payout or expense, linked back to the transfer via transferId, that
+     draws down a bucket WITHOUT touching any account balance again - the
+     cash already moved once, via the transfer itself. Distributing never
+     has to happen all at once or even fully: whatever's left of the
+     transfer's amount with no distribution against it yet is "afloat". */
+  function transferDistributions(transferId) {
+    return state.transactions.filter(function (t) { return t.transferId === transferId; });
+  }
+  function transferAfloat(transfer, distributions) {
+    var distributed = (distributions || transferDistributions(transfer.id)).reduce(function (s, t) { return s + (Number(t.amount) || 0); }, 0);
+    return round2((Number(transfer.amount) || 0) - distributed);
+  }
+
+  function renderTransferMasterCard(transfer, distributions) {
+    var total = round2(Number(transfer.amount) || 0);
+    var afloat = transferAfloat(transfer, distributions);
+    var fromA = accountById(transfer.accountId), toA = accountById(transfer.toAccountId);
+
+    var chips = distributions.length ? '<div class="chip-row">' + distributions.map(function (tx) {
+      var b = bucketById(tx.bucketId);
+      var hue = b ? bucketColor(bucketIndex(tx.bucketId)) : null;
+      var style = hue ? ' style="--chip-soft:var(--' + hue + '-soft);--chip-color:var(--' + hue + ')"' : "";
+      return '<span class="chip"' + style + '>' + esc(b ? b.name : "?") + ' ' + fmt(tx.amount) + '</span>';
+    }).join("") + '</div>' : "";
+
+    var note = (fromA ? esc(fromA.name) : "?") + " → " + (toA ? esc(toA.name) : "?");
+    var afloatHtml = afloat > 0.004
+      ? '<div class="ledger-note split-afloat-note">' + fmt(afloat) + ' not yet distributed</div>'
+      : "";
+
+    var actions = '<button class="link-btn" data-action="edit" data-id="' + transfer.id + '">Edit</button>' +
+      '<button class="link-btn danger" data-action="delete" data-id="' + transfer.id + '">Delete</button>' +
+      (afloat > 0.004 ? '<button class="link-btn" data-action="distribute-transfer" data-id="' + transfer.id + '">Distribute →</button>' : "");
+
+    return (
+      '<div class="ledger-item">' +
+        '<div class="ledger-top">' +
+          '<div><div class="ledger-desc">' + esc(transfer.description || "(no description)") + '</div><div class="ledger-date">' + esc(transfer.date) + '</div></div>' +
+          '<div class="ledger-amt num">' + curr() + ' ' + fmt(total) + '</div>' +
+        '</div>' +
+        chips +
+        '<div class="ledger-note">' + note + '</div>' +
+        afloatHtml +
+        '<div class="ledger-actions">' + actions + '</div>' +
+      '</div>'
+    );
+  }
+
+  function renderTransferSplitGroup(transfer, distributions) {
+    var stable = distributions.slice().sort(function (a, b) { return (a.createdAt || 0) - (b.createdAt || 0); });
+    return renderStackedLedgerGroup(transfer.id, renderTransferMasterCard(transfer, stable), stable);
   }
 
   // Sizes every split stack in wrap against its REAL current width - split
@@ -2307,9 +2455,11 @@
       wrap.innerHTML = '<div class="empty-state">No transactions match your filters.</div>';
       return;
     }
-    var groups = groupAdjacentLedgerSplits(filtered);
+    var groups = groupLedgerRows(filtered);
     wrap.innerHTML = '<div class="ledger-list">' + groups.map(function (g) {
-      return g.kind === "split" ? renderSplitLedgerGroup(g.rows) : renderLedgerItem(g.tx);
+      if (g.kind === "split") return renderSplitLedgerGroup(g.rows);
+      if (g.kind === "transfer-split") return renderTransferSplitGroup(g.transfer, g.distributions);
+      return renderLedgerItem(g.tx);
     }).join("") + '</div>';
     wireSplitStacks(wrap);
   }
@@ -2330,7 +2480,7 @@
     var isIn = tx.type === "income" || tx.type === "opening_balance";
     var amtClass = isIn ? "pos" : (isOut ? "neg" : "");
     var amtSign = isIn ? "+" : (isOut ? "−" : "");
-    var chips = "", note = "";
+    var chips = "", note = "", afloatNote = "";
 
     var recurringBadge = tx.recurring && tx.recurring.active ? '<span class="chip recurring-badge">↻ ' + esc(tx.recurring.frequency) + '</span>'
       : (tx.recurringSourceId ? '<span class="chip recurring-badge">↻ auto-logged</span>' : "");
@@ -2365,6 +2515,8 @@
     } else if (tx.type === "transfer") {
       var fromA = accountById(tx.accountId), toA = accountById(tx.toAccountId);
       note = (fromA ? esc(fromA.name) : "?") + " → " + (toA ? esc(toA.name) : "?");
+      var tAfloat = transferAfloat(tx);
+      if (tAfloat > 0.004) afloatNote = fmt(tAfloat) + " not yet distributed";
     } else if (tx.type === "payout") {
       var bP = bucketById(tx.bucketId);
       var toBucket = tx.toBucketId ? bucketById(tx.toBucketId) : null;
@@ -2391,6 +2543,7 @@
       actions += '<button class="link-btn" data-action="confirm" data-id="' + tx.id + '">Confirm</button>';
     }
     actions += '<button class="link-btn danger" data-action="delete" data-id="' + tx.id + '">Delete</button>';
+    if (afloatNote) actions += '<button class="link-btn" data-action="distribute-transfer" data-id="' + tx.id + '">Distribute →</button>';
 
     var floorNote = lastDerived && lastDerived.txFloorNotes ? lastDerived.txFloorNotes[tx.id] : null;
     var badgeHtml = splitBadge ? '<span class="split-corner-badge">' + esc(splitBadge) + '</span>' : "";
@@ -2405,6 +2558,7 @@
         '<div class="ledger-note">' + note + '</div>' +
         (tx.notes ? '<div class="ledger-note ledger-user-note">' + esc(tx.notes) + '</div>' : "") +
         (floorNote ? '<div class="ledger-floor-note">' + floorNote + '</div>' : "") +
+        (afloatNote ? '<div class="ledger-note split-afloat-note">' + afloatNote + '</div>' : "") +
         '<div class="ledger-actions">' + actions + badgeHtml + '</div>' +
       '</div>'
     );
@@ -2705,6 +2859,122 @@
     showToast((isPayout ? "Payout" : "Expense") + " split updated.");
   }
 
+  /* ---------------- distribute a transfer ----------------
+     Adds ONE new payout or expense against a transfer's afloat amount -
+     a normal transaction except it carries transferId instead of its own
+     account effect (the cash already moved via the transfer itself; see
+     computeDerived - a payout with no fromAccountId, or an expense with
+     affectsAccount:false, only ever touches the bucket side). Stays open
+     after each add so logging several distributions in one sitting (the
+     common case - "3410 to Owner's Pay, 1200 to Opex, ...") doesn't mean
+     reopening the sheet each time; closing early with afloat still left
+     is exactly the "distribute whenever" flow this exists for. */
+  var distributingTransferId = null;
+  var distributeType = "payout";
+
+  function openDistributeTransferSheet(transferId) {
+    distributingTransferId = transferId;
+    distributeType = "payout";
+    document.getElementById("distributeTransferOverlay").classList.add("open");
+    renderDistributeTransferSheet();
+  }
+  function closeDistributeTransferSheet() {
+    distributingTransferId = null;
+    document.getElementById("distributeTransferOverlay").classList.remove("open");
+  }
+
+  function deleteTransferAndDistributions(transferId) {
+    var distributions = transferDistributions(transferId);
+    var typeLabel = distributions.length ? "transfer and its " + distributions.length + " distribution" + (distributions.length === 1 ? "" : "s") : "transfer";
+    return openConfirm("Delete this " + typeLabel + "? This can't be undone.", "Delete", true).then(function (ok) {
+      if (!ok) return false;
+      var ids = [transferId].concat(distributions.map(function (d) { return d.id; }));
+      state.transactions = state.transactions.filter(function (t) { return ids.indexOf(t.id) === -1; });
+      if (!state.deletedTransactionIds) state.deletedTransactionIds = [];
+      ids.forEach(function (id) { if (state.deletedTransactionIds.indexOf(id) === -1) state.deletedTransactionIds.push(id); });
+      persist();
+      showToast("Deleted.");
+      return true;
+    });
+  }
+
+  function renderDistributeTransferSheet() {
+    var sheet = document.getElementById("distributeTransferSheet");
+    var transfer = state.transactions.find(function (t) { return t.id === distributingTransferId; });
+    if (!transfer) { closeDistributeTransferSheet(); return; }
+    var distributions = transferDistributions(transfer.id).sort(function (a, b) { return (a.createdAt || 0) - (b.createdAt || 0); });
+    var afloat = transferAfloat(transfer, distributions);
+    var fromA = accountById(transfer.accountId), toA = accountById(transfer.toAccountId);
+
+    var distributedRows = distributions.length
+      ? distributions.map(function (tx) {
+          var b = bucketById(tx.bucketId);
+          return '<div class="ledger-note" style="display:flex; justify-content:space-between; gap:10px">' +
+            '<span>' + esc(b ? b.name : "?") + (tx.description ? " — " + esc(tx.description) : "") + '</span>' +
+            '<span class="num">' + fmt(tx.amount) + '</span>' +
+          '</div>';
+        }).join("")
+      : '<div class="ledger-note">Nothing distributed yet.</div>';
+
+    sheet.innerHTML =
+      '<div class="sheet-head"><h3>Distribute transfer</h3><button class="icon-btn" id="distributeClose" aria-label="Close">' + xIcon() + '</button></div>' +
+      '<div class="ledger-note" style="margin:-6px 0 4px">' + esc(transfer.description || "(no description)") + ' · ' + esc(transfer.date) + ' · ' + (fromA ? esc(fromA.name) : "?") + ' → ' + (toA ? esc(toA.name) : "?") + '</div>' +
+      '<div class="ledger-top" style="margin:10px 0"><div>Total</div><div class="ledger-amt num">' + curr() + ' ' + fmt(transfer.amount) + '</div></div>' +
+      distributedRows +
+      '<div class="split-remaining ' + (afloat > 0.004 ? "bad" : "ok") + '" style="margin-top:8px">' + (afloat > 0.004 ? fmt(afloat) + " afloat — not yet distributed." : "Fully distributed.") + '</div>' +
+      (afloat > 0.004 ? (
+        '<div class="segmented" style="max-width:220px; margin-top:14px">' +
+          '<button type="button" data-distribute-type="payout" class="' + (distributeType === "payout" ? "active" : "") + '">Payout</button>' +
+          '<button type="button" data-distribute-type="expense" class="' + (distributeType === "expense" ? "active" : "") + '">Expense</button>' +
+        '</div>' +
+        '<div class="field"><label>Bucket</label><select class="select" id="distributeBucket">' + bucketOptions(null) + '</select></div>' +
+        '<div class="field"><label>Amount</label><input class="input" type="number" step="0.01" min="0" id="distributeAmount" value="' + afloat + '"></div>' +
+        '<div class="field"><label>Description (optional)</label><input class="input" type="text" id="distributeDesc" placeholder="' + esc(transfer.description || "") + '"></div>' +
+        '<div class="field"><label>Notes (optional)</label><textarea class="input" id="distributeNotes"></textarea></div>' +
+        '<button type="button" class="btn btn-primary" id="distributeAdd">Add distribution</button>'
+      ) : "") +
+      '<button type="button" class="link-btn" id="distributeDone" style="margin-top:14px">Done</button>';
+
+    sheet.querySelector("#distributeClose").addEventListener("click", closeDistributeTransferSheet);
+    sheet.querySelector("#distributeDone").addEventListener("click", closeDistributeTransferSheet);
+    Array.prototype.forEach.call(sheet.querySelectorAll("[data-distribute-type]"), function (btn) {
+      btn.addEventListener("click", function () {
+        distributeType = btn.getAttribute("data-distribute-type");
+        renderDistributeTransferSheet();
+      });
+    });
+    var addBtn = sheet.querySelector("#distributeAdd");
+    if (addBtn) addBtn.addEventListener("click", handleDistributeTransferSubmit);
+  }
+
+  function handleDistributeTransferSubmit() {
+    var sheet = document.getElementById("distributeTransferSheet");
+    var transfer = state.transactions.find(function (t) { return t.id === distributingTransferId; });
+    if (!transfer) { closeDistributeTransferSheet(); return; }
+    var afloat = transferAfloat(transfer);
+    var bucketId = sheet.querySelector("#distributeBucket").value;
+    var amount = round2(parseFloat(sheet.querySelector("#distributeAmount").value) || 0);
+    var desc = (sheet.querySelector("#distributeDesc").value || "").trim();
+    var notes = sheet.querySelector("#distributeNotes").value;
+    if (!(amount > 0)) { showToast("Amount must be greater than 0."); return; }
+    if (amount - afloat > 0.004) { showToast("Can't distribute more than " + fmt(afloat) + " afloat."); return; }
+
+    var now = Date.now();
+    var isPayout = distributeType === "payout";
+    var tx = {
+      id: uid(), type: isPayout ? "payout" : "expense", date: transfer.date,
+      description: desc || transfer.description || (isPayout ? "Payout" : "Expense"),
+      notes: notes, amount: amount, bucketId: bucketId,
+      transferId: transfer.id, createdAt: now, updatedAt: now
+    };
+    if (!isPayout) { tx.affectsBucket = true; tx.affectsAccount = false; }
+    state.transactions.push(tx);
+    persist();
+    renderDistributeTransferSheet();
+    render();
+    showToast("Distributed " + fmt(amount) + " to " + (bucketById(bucketId) ? bucketById(bucketId).name : "bucket") + ".");
+  }
+
   function accountOptions(selectedId) {
     return state.accounts.map(function (a) {
       return '<option value="' + a.id + '"' + (a.id === selectedId ? " selected" : "") + '>' + esc(a.name) + '</option>';
@@ -2817,111 +3087,6 @@
       var amt = round2(parseFloat(row.querySelector('input[type="number"]').value) || 0);
       if (amt > 0) {
         result.push({ accountId: accountId, amount: amt });
-        sum += amt;
-      }
-    });
-    var diff = round2(sum - totalAmount);
-    return { rows: result, valid: result.length >= 2 && Math.abs(diff) <= 0.004 };
-  }
-
-  // Split a payout's SOURCE across two or more buckets in one go (e.g. a
-  // vendor invoice funded partly from Opex, partly from Profit) - mirrors
-  // splitAccountsSectionHtml/wireSplitSection/readSplitRows above but keyed
-  // by bucket instead of account, and kept as its own set of functions
-  // rather than folded into those: the two features toggle mutually
-  // exclusive UI (this hides the single "From bucket" field entirely,
-  // since each row picks its own), so sharing one row-parsing path would
-  // just add branching without saving real code.
-  function splitBucketsSectionHtml(prefix, defaultBucketId) {
-    var rowsHtml = "";
-    for (var i = 0; i < SPLIT_ROW_COUNT; i++) {
-      rowsHtml += '<div class="row2 split-bucket-row" data-split-bucket-row="' + i + '"' + (i >= 2 ? ' style="display:none"' : '') + '>' +
-        '<div class="field"><label>Bucket</label><select class="select" id="f' + prefix + 'SplitBucket' + i + '">' + bucketOptions(i === 0 ? defaultBucketId : null) + '</select></div>' +
-        '<div class="field"><label>Amount</label><input class="input" type="number" step="0.01" min="0" id="f' + prefix + 'SplitBucketAmount' + i + '" placeholder="0.00"></div>' +
-      '</div>';
-    }
-    return (
-      '<label class="check-row"><input type="checkbox" id="f' + prefix + 'BucketSplit"> Split across buckets</label><div class="check-note">Fund this payout from two or more buckets at once — it shows as one grouped entry in the ledger.</div>' +
-      '<div id="f' + prefix + 'BucketSplitWrap" style="display:none">' +
-        rowsHtml +
-        '<button type="button" class="link-btn" id="f' + prefix + 'BucketSplitAddRow">+ Add another bucket</button>' +
-        '<div class="split-remaining" id="f' + prefix + 'BucketSplitRemaining"></div>' +
-      '</div>'
-    );
-  }
-
-  function wireBucketSplitSection(sheet, prefix, otherToggleSelectors) {
-    var toggle = sheet.querySelector("#f" + prefix + "BucketSplit");
-    var wrap = sheet.querySelector("#f" + prefix + "BucketSplitWrap");
-    if (!toggle || !wrap) return;
-    var amountInput = sheet.querySelector("#fAmount");
-    var addBtn = sheet.querySelector("#f" + prefix + "BucketSplitAddRow");
-    var remainingEl = sheet.querySelector("#f" + prefix + "BucketSplitRemaining");
-    var rows = Array.prototype.slice.call(sheet.querySelectorAll("[data-split-bucket-row]"));
-    var otherSelectors = [].concat(otherToggleSelectors || []);
-    var fromBucketField = sheet.querySelector("#fBucket");
-    var fromBucketWrap = fromBucketField ? fromBucketField.closest(".field") : null;
-    var fromCaption = sheet.querySelector("#fFromCaption");
-
-    function updateRemaining() {
-      var total = round2(parseFloat(amountInput.value) || 0);
-      var sum = 0;
-      rows.forEach(function (row) {
-        if (row.style.display === "none") return;
-        sum += round2(parseFloat(row.querySelector('input[type="number"]').value) || 0);
-      });
-      var remaining = round2(total - sum);
-      if (!remainingEl) return;
-      if (Math.abs(remaining) <= 0.004) {
-        remainingEl.textContent = "Fully allocated.";
-        remainingEl.className = "split-remaining ok";
-      } else if (remaining > 0) {
-        remainingEl.textContent = fmt(remaining) + " left to allocate.";
-        remainingEl.className = "split-remaining bad";
-      } else {
-        remainingEl.textContent = fmt(Math.abs(remaining)) + " over the total amount.";
-        remainingEl.className = "split-remaining bad";
-      }
-    }
-
-    toggle.addEventListener("change", function () {
-      wrap.style.display = toggle.checked ? "" : "none";
-      if (fromBucketWrap) fromBucketWrap.style.display = toggle.checked ? "none" : "";
-      if (fromCaption) fromCaption.style.display = toggle.checked ? "none" : "";
-      otherSelectors.forEach(function (sel) {
-        var otherToggle = sheet.querySelector(sel);
-        if (toggle.checked && otherToggle && otherToggle.checked) {
-          otherToggle.checked = false;
-          otherToggle.dispatchEvent(new Event("change", { bubbles: true }));
-        }
-      });
-      updateRemaining();
-    });
-    amountInput.addEventListener("input", updateRemaining);
-    rows.forEach(function (row) {
-      row.querySelector('input[type="number"]').addEventListener("input", updateRemaining);
-    });
-    if (addBtn) {
-      addBtn.addEventListener("click", function () {
-        var hiddenRow = rows.find(function (r) { return r.style.display === "none"; });
-        if (hiddenRow) hiddenRow.style.display = "";
-        if (!rows.some(function (r) { return r.style.display === "none"; })) addBtn.style.display = "none";
-        updateRemaining();
-      });
-    }
-    updateRemaining();
-  }
-
-  function readSplitBucketRows(sheet, totalAmount) {
-    var rows = sheet.querySelectorAll("[data-split-bucket-row]");
-    var result = [];
-    var sum = 0;
-    rows.forEach(function (row) {
-      if (row.style.display === "none") return;
-      var bucketId = row.querySelector("select").value;
-      var amt = round2(parseFloat(row.querySelector('input[type="number"]').value) || 0);
-      if (amt > 0) {
-        result.push({ bucketId: bucketId, amount: amt });
         sum += amt;
       }
     });
@@ -3065,7 +3230,6 @@
         '<div id="fPayoutDiffAccountWrap" class="field" style="display:' + (payoutDiffAccount ? "" : "none") + '"><label>Account</label><select class="select" id="fFromAccount">' + accountOptions(payoutFromAcctId) + '</select></div>' +
         (editingTx ? "" :
           splitAccountsSectionHtml("Payout", effAcct0 ? effAcct0.id : null) +
-          splitBucketsSectionHtml("Payout", payoutBucket0 ? payoutBucket0.id : null) +
           '<label class="check-row"><input type="checkbox" id="fFee"> Deduct fee</label>' +
           '<div id="fFeeWrap" style="display:none">' +
             '<div class="row2">' +
@@ -3126,10 +3290,7 @@
     wireTxSheetChrome();
 
     if (txTab === "expense") wireSplitSection(sheet, "Expense", "#fDiffAccount");
-    if (txTab === "payout") {
-      wireSplitSection(sheet, "Payout", ["#fPayoutDiffAccount", "#fPayoutBucketSplit"]);
-      wireBucketSplitSection(sheet, "Payout", ["#fPayoutDiffAccount", "#fPayoutSplit"]);
-    }
+    if (txTab === "payout") wireSplitSection(sheet, "Payout", "#fPayoutDiffAccount");
 
     var amountInput = sheet.querySelector("#fAmount");
     var materialsInput = sheet.querySelector("#fMaterials");
@@ -3163,13 +3324,11 @@
     if (payoutDiffAccountToggle) {
       payoutDiffAccountToggle.addEventListener("change", function () {
         document.getElementById("fPayoutDiffAccountWrap").style.display = payoutDiffAccountToggle.checked ? "" : "none";
-        ["#fPayoutSplit", "#fPayoutBucketSplit"].forEach(function (sel) {
-          var otherToggle = sheet.querySelector(sel);
-          if (payoutDiffAccountToggle.checked && otherToggle && otherToggle.checked) {
-            otherToggle.checked = false;
-            otherToggle.dispatchEvent(new Event("change", { bubbles: true }));
-          }
-        });
+        var splitToggle = sheet.querySelector("#fPayoutSplit");
+        if (payoutDiffAccountToggle.checked && splitToggle && splitToggle.checked) {
+          splitToggle.checked = false;
+          splitToggle.dispatchEvent(new Event("change", { bubbles: true }));
+        }
       });
     }
     var feeToggle = sheet.querySelector("#fFee");
@@ -3383,31 +3542,6 @@
         showToast("Payout split across " + paySplit.rows.length + " accounts.");
         return;
       }
-      var payoutBucketSplitToggle = sheet.querySelector("#fPayoutBucketSplit");
-      if (!editingTx && payoutBucketSplitToggle && payoutBucketSplitToggle.checked) {
-        var bucketSplit = readSplitBucketRows(sheet, amount);
-        if (!bucketSplit.valid) { showToast("Split amounts must add up to the total, across at least 2 buckets."); return; }
-        var bsToAccountId = null, bsToBucketId = null;
-        if (destRaw0.indexOf("account:") === 0) bsToAccountId = destRaw0.slice(8);
-        else if (destRaw0.indexOf("bucket:") === 0) { bsToBucketId = destRaw0.slice(7); bsToAccountId = effectiveBucketAccountId(bucketById(bsToBucketId)); }
-        var bsGroupId = uid();
-        var bsNow = Date.now();
-        bucketSplit.rows.forEach(function (row, i) {
-          state.transactions.push({
-            id: uid(), type: "payout", date: date,
-            description: desc || "Payout",
-            notes: notes, amount: row.amount, bucketId: row.bucketId,
-            toAccountId: bsToAccountId, toBucketId: bsToBucketId,
-            fromAccountId: effectiveBucketAccountId(bucketById(row.bucketId)),
-            splitGroupId: bsGroupId, createdAt: bsNow + i
-          });
-        });
-        persist();
-        closeTxSheet();
-        render();
-        showToast("Payout split across " + bucketSplit.rows.length + " buckets.");
-        return;
-      }
       var payoutDiffToggle = sheet.querySelector("#fPayoutDiffAccount");
       var fromAccountId = (payoutDiffToggle && payoutDiffToggle.checked)
         ? sheet.querySelector("#fFromAccount").value
@@ -3544,6 +3678,10 @@
         deleteSplitGroup(tx.splitGroupId).then(function (ok) { if (ok) render(); });
         return;
       }
+      if (tx.type === "transfer" && transferDistributions(tx.id).length) {
+        deleteTransferAndDistributions(tx.id).then(function (ok) { if (ok) render(); });
+        return;
+      }
       openConfirm("Delete this transaction? This can't be undone.", "Delete", true).then(function (ok) {
         if (!ok) return;
         state.transactions = state.transactions.filter(function (t) { return t.id !== id; });
@@ -3562,6 +3700,8 @@
     } else if (action === "edit") {
       if (tx.splitGroupId) { openEditSplitGroupSheet(tx.splitGroupId); return; }
       openEditTxSheet(tx);
+    } else if (action === "distribute-transfer") {
+      openDistributeTransferSheet(id);
     }
   });
 
@@ -4546,6 +4686,7 @@
   document.getElementById("distributeOverlay").addEventListener("click", function (e) { if (e.target.id === "distributeOverlay") closeDistributeSheet(); });
   document.getElementById("bugReportOverlay").addEventListener("click", function (e) { if (e.target.id === "bugReportOverlay") closeBugReportSheet(); });
   document.getElementById("editSplitOverlay").addEventListener("click", function (e) { if (e.target.id === "editSplitOverlay") closeEditSplitSheet(); });
+  document.getElementById("distributeTransferOverlay").addEventListener("click", function (e) { if (e.target.id === "distributeTransferOverlay") closeDistributeTransferSheet(); });
   document.addEventListener("keydown", function (e) {
     if (e.key !== "Escape") return;
     if (document.getElementById("txOverlay").classList.contains("open")) closeTxSheet();
@@ -4554,6 +4695,7 @@
     if (document.getElementById("distributeOverlay").classList.contains("open")) closeDistributeSheet();
     if (document.getElementById("bugReportOverlay").classList.contains("open")) closeBugReportSheet();
     if (document.getElementById("editSplitOverlay").classList.contains("open")) closeEditSplitSheet();
+    if (document.getElementById("distributeTransferOverlay").classList.contains("open")) closeDistributeTransferSheet();
     if (document.getElementById("confirmOverlay").classList.contains("open")) document.getElementById("confirmOverlay").classList.remove("open");
   });
   window.addEventListener("beforeunload", function (e) {
