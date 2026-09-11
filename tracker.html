@@ -382,16 +382,23 @@
      BEFORE the focused leg shows only as a blank sliver (nothing to see,
      already stepped past); whatever comes AFTER shows as one combined
      edge with the TOTAL of those legs' amounts, not each one's own -
-     clicking either edge steps focus one leg in that direction. Sizes are
-     set in JS (sizeSplitStacks) against the stack's real measured width. */
+     clicking either edge steps focus one leg in that direction.
+     To actually read as a stack (not same-height boxes sitting next to
+     each other), the rest cards sit BEHIND the focused one - z-index
+     lower, tucked partly underneath it (their inner edge is hidden under
+     the focused card's footprint), and inset vertically top+bottom so
+     what peeks out on either side is visibly a SMALLER card, rounded
+     corners and all, not a full-height slab. Sizes/positions are set in
+     JS (sizeSplitStacks) against the stack's real measured width. */
   .split-card-stack { position: relative; }
-  .split-stack-focus { position: absolute; top: 0; }
+  .split-stack-focus { position: absolute; top: 0; z-index: 2; }
   .split-stack-rest {
-    position: absolute; top: 0; cursor: pointer; transition: transform 0.15s ease;
+    position: absolute; z-index: 1; cursor: pointer; transition: transform 0.15s ease;
     background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
-    box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+    box-shadow: 0 3px 10px rgba(0,0,0,0.22);
+    box-sizing: border-box;
   }
-  .split-stack-rest-after { display: flex; align-items: flex-start; justify-content: flex-end; padding: 11px 13px; box-sizing: border-box; }
+  .split-stack-rest-after { display: flex; align-items: center; justify-content: flex-end; padding: 0 13px; }
   .split-stack-rest:hover { transform: translateY(-2px); }
   .split-chip { background: var(--surface-2); color: var(--text-muted); font-weight: 600; }
   .ledger-top { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
@@ -2157,8 +2164,10 @@
   // via the plain "rest" edges on either side (never the focused card
   // itself, which isn't a stacking control - it's just a normal entry).
   var splitStackFocus = {};
-  var SPLIT_STACK_LEFT_WIDTH = 14;
-  var SPLIT_STACK_RIGHT_WIDTH = 112;
+  var SPLIT_STACK_LEFT_PEEK = 14;
+  var SPLIT_STACK_RIGHT_PEEK = 100;
+  var SPLIT_STACK_UNDERLAP = 18;
+  var SPLIT_STACK_V_INSET = 9;
   var SPLIT_STACK_MIN_FOCUS_WIDTH = 180;
 
   function renderSplitLedgerGroup(rows) {
@@ -2212,16 +2221,31 @@
       var before = stack.querySelector(".split-stack-rest-before");
       var after = stack.querySelector(".split-stack-rest-after");
       var focus = stack.querySelector(".split-stack-focus");
-      var leftW = before ? SPLIT_STACK_LEFT_WIDTH : 0;
-      var rightW = after ? Math.min(SPLIT_STACK_RIGHT_WIDTH, Math.max(0, containerWidth - SPLIT_STACK_MIN_FOCUS_WIDTH - leftW)) : 0;
-      var focusW = Math.max(SPLIT_STACK_MIN_FOCUS_WIDTH, containerWidth - leftW - rightW);
-      if (before) { before.style.left = "0px"; before.style.width = leftW + "px"; }
-      if (focus) { focus.style.left = leftW + "px"; focus.style.width = focusW + "px"; }
-      if (after) { after.style.left = (leftW + focusW) + "px"; after.style.width = rightW + "px"; }
+      var leftPeek = before ? SPLIT_STACK_LEFT_PEEK : 0;
+      var rightPeek = after ? Math.min(SPLIT_STACK_RIGHT_PEEK, Math.max(0, containerWidth - SPLIT_STACK_MIN_FOCUS_WIDTH - leftPeek)) : 0;
+      var focusW = Math.max(SPLIT_STACK_MIN_FOCUS_WIDTH, containerWidth - leftPeek - rightPeek);
+      var focusLeft = leftPeek;
+      if (focus) { focus.style.left = focusLeft + "px"; focus.style.width = focusW + "px"; }
       var h = focus ? focus.offsetHeight : 0;
       stack.style.height = h + "px";
-      if (before) before.style.height = h + "px";
-      if (after) after.style.height = h + "px";
+      // Rest cards tuck partly UNDER the focused card (hidden there, since
+      // the focused card has the higher z-index) and are inset vertically
+      // top+bottom, so what actually peeks out beyond the focused card's
+      // edge reads as a genuinely smaller card behind it, not a same-height
+      // slab sitting next to it.
+      var restH = Math.max(0, h - SPLIT_STACK_V_INSET * 2);
+      if (before) {
+        before.style.top = SPLIT_STACK_V_INSET + "px";
+        before.style.height = restH + "px";
+        before.style.left = "0px";
+        before.style.width = (leftPeek + SPLIT_STACK_UNDERLAP) + "px";
+      }
+      if (after) {
+        after.style.top = SPLIT_STACK_V_INSET + "px";
+        after.style.height = restH + "px";
+        after.style.left = (focusLeft + focusW - SPLIT_STACK_UNDERLAP) + "px";
+        after.style.width = (rightPeek + SPLIT_STACK_UNDERLAP) + "px";
+      }
     });
   }
 
