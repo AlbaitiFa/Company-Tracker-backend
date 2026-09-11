@@ -2161,32 +2161,72 @@
       if (frontIdx > 0) ordered.unshift(ordered.splice(frontIdx, 1)[0]);
     }
     var n = ordered.length;
+    // Width is set for real in wireSplitStacks, against the container's
+    // actual measured pixel width - a CSS-only guess (100% minus a fixed
+    // px peek per card) can't know that width up front, and on a narrow
+    // phone screen the front card's width floors out before the back
+    // cards' do, collapsing the gap between them and cutting off a middle
+    // card's amount. z-index doesn't depend on measured layout, so it's
+    // still set here.
     var cards = ordered.map(function (tx, i) {
-      // i=0 is the front (topmost, narrowest) card; i=n-1 sits furthest
-      // back at full width. Each card behind the front one is that much
-      // wider, so its right edge - where the amount lives - peeks out.
-      var width = "max(190px, calc(100% - " + (SPLIT_STACK_PEEK * (n - 1 - i)) + "px))";
       var z = n - i;
-      return '<div class="split-stack-card" style="width:' + width + '; z-index:' + z + '" data-tx-id="' + tx.id + '" data-split-group="' + groupId + '">' +
+      return '<div class="split-stack-card" style="z-index:' + z + '" data-tx-id="' + tx.id + '" data-split-group="' + groupId + '">' +
         renderLedgerItem(tx) +
       '</div>';
     }).join("");
     return '<div class="split-card-stack" data-split-group="' + groupId + '">' + cards + '</div>';
   }
 
-  function wireSplitStacks(wrap) {
+  var SPLIT_STACK_MIN_FRONT_WIDTH = 190;
+
+  // Sizes every split stack in wrap against its REAL current width - split
+  // out from wireSplitStacks (which also attaches click listeners, only
+  // needed once per render) so the window resize handler below can just
+  // re-measure on rotate/resize without piling up duplicate listeners.
+  function sizeSplitStacks(wrap) {
     Array.prototype.forEach.call(wrap.querySelectorAll(".split-card-stack"), function (stack) {
-      var groupId = stack.getAttribute("data-split-group");
-      var maxH = 0;
-      Array.prototype.forEach.call(stack.querySelectorAll(".split-stack-card"), function (card) {
-        maxH = Math.max(maxH, card.offsetHeight);
-        card.addEventListener("click", function (e) {
-          if (e.target.closest("button")) return; // let Edit/Delete work normally
-          splitStackFront[groupId] = card.getAttribute("data-tx-id");
-          renderLedgerList();
-        });
+      var cards = Array.prototype.slice.call(stack.querySelectorAll(".split-stack-card"));
+      var n = cards.length;
+      // Derive the peek from the container's REAL width so cards never
+      // overlap past their intended edge: the front card can't shrink
+      // below a readable minimum, so on a narrow screen the peek between
+      // EVERY adjacent pair shrinks together (never independently), which
+      // is what keeps each card's amount fully clear of the one in front
+      // of it instead of one gap collapsing while others stay full-size.
+      var containerWidth = stack.clientWidth || SPLIT_STACK_MIN_FRONT_WIDTH;
+      var minFront = Math.min(SPLIT_STACK_MIN_FRONT_WIDTH, containerWidth);
+      var peek = n > 1 ? Math.min(SPLIT_STACK_PEEK, (containerWidth - minFront) / (n - 1)) : 0;
+      var frontWidth = containerWidth - peek * (n - 1);
+      // Only the front (topmost, index 0) card shows in full and sets the
+      // stack's height. Every card behind it is clipped down to just its
+      // own top row - where its amount lives - so what peeks out from
+      // under the front card is ALWAYS only the amount, never a stray
+      // line of notes or a second set of Edit/Delete links, regardless of
+      // how much taller or shorter that leg's own content happens to be.
+      cards.forEach(function (card, i) {
+        card.style.width = (frontWidth + peek * i) + "px";
+        if (i === 0) {
+          stack.style.height = card.offsetHeight + "px";
+        } else {
+          var top = card.querySelector(".ledger-top");
+          var item = card.querySelector(".ledger-item");
+          var vPad = item ? (parseFloat(getComputedStyle(item).paddingTop) + parseFloat(getComputedStyle(item).paddingBottom)) : 0;
+          card.style.maxHeight = ((top ? top.offsetHeight : 0) + vPad) + "px";
+          card.style.overflow = "hidden";
+        }
       });
-      stack.style.height = maxH + "px";
+    });
+  }
+
+  function wireSplitStacks(wrap) {
+    sizeSplitStacks(wrap);
+    Array.prototype.forEach.call(wrap.querySelectorAll(".split-stack-card"), function (card) {
+      var groupId = card.getAttribute("data-split-group");
+      card.addEventListener("click", function (e) {
+        if (e.target.closest("button")) return; // let Edit/Delete work normally
+        splitStackFront[groupId] = card.getAttribute("data-tx-id");
+        renderLedgerList();
+      });
     });
   }
 
@@ -4140,6 +4180,8 @@
   window.addEventListener("resize", function () {
     updateTopbarHeightVar();
     updateArrowDockVar(manuallyFrozen);
+    var ledgerWrap = document.getElementById("ledgerListWrap");
+    if (ledgerWrap) sizeSplitStacks(ledgerWrap);
   });
 
   // Accounts + Buckets stay unfrozen (normal scroll) by default - no
