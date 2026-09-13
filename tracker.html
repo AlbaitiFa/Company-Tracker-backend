@@ -376,30 +376,32 @@
   .filter-badge { font-size: 0.65rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--accent); background: var(--accent-soft); padding: 1px 6px; border-radius: 999px; }
   .ledger-list { display: flex; flex-direction: column; gap: 8px; }
   .ledger-item { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 11px 13px; }
-  /* Legs of one split transaction (same splitGroupId): one is "focused"
-     (a full, normal .ledger-item - own Edit/Delete) with an "i/N" corner
-     badge. Order is fixed at creation order and never reshuffles - only
-     which leg is focused changes. EVERY other leg gets its own plain
-     stacked edge (no amount preview, just the visual cue a card is there)
-     cascading outward on whichever side it actually sits relative to
-     focus, each one tucked partly under the one closer to focus (z-index
-     lower going outward), all at the SAME height as the focused card.
-     Clicking an edge jumps focus directly to that leg. Sizes/positions
-     are set in JS (sizeSplitStacks) against the stack's real measured
-     width - see there for the cascade math. */
-  /* isolation:isolate gives this its own stacking context, so the
-     z-indexes inside (however large) only ever compete with each other -
-     never with the sticky header, a modal overlay, or anything else on
-     the page (which is exactly what broke: .split-stack-focus at
-     z-index:100 was floating above the header and even above open
-     modals, since without isolation it was competing globally). */
-  .split-card-stack { position: relative; isolation: isolate; }
-  .split-stack-focus { position: absolute; top: 0; z-index: 10; }
-  .split-stack-rest {
-    position: absolute; top: 0; cursor: pointer;
-    background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
-    box-sizing: border-box;
+  /* Legs of one split transaction (same splitGroupId, or a transfer +
+     its distributions): a master/overview card on top, never itself a
+     click target (it carries real Edit/Delete/Distribute buttons - see
+     the master-card-shouldn't-be-clickable decision this replaced).
+     Collapsed, a few plain slivers cascade below it - narrower and lower
+     z-index the further down - as a pure "there's more underneath" cue,
+     stacked from the bottom. The whole sliver group is one click target
+     that expands the group into every leg as a normal full-size card,
+     with a plain collapse control back at the bottom. No JS measurement
+     needed either way - it's all normal flow with a little negative
+     margin to make the slivers overlap their neighbor above. */
+  .split-card-stack { display: flex; flex-direction: column; }
+  .split-stack-top { position: relative; z-index: 2; }
+  .split-stack-peek-group { cursor: pointer; }
+  .split-stack-peek {
+    height: 9px; margin-top: -1px; box-sizing: border-box;
+    background: var(--surface); border: 1px solid var(--border); border-top: none;
+    border-radius: 0 0 12px 12px;
   }
+  .split-stack-peek-group:hover .split-stack-peek:first-child { background: var(--surface-2); }
+  .split-stack-legs { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+  .split-stack-collapse {
+    text-align: center; cursor: pointer; color: var(--text-muted); font-size: 0.7rem;
+    margin-top: 2px; padding: 3px 0;
+  }
+  .split-stack-collapse:hover { color: var(--text); }
   .split-corner-badge {
     font-family: var(--font-mono); font-size: 0.68rem; font-weight: 600;
     color: var(--text-muted); background: var(--surface-2);
@@ -2215,18 +2217,12 @@
     return out;
   }
 
-  // Which leg is currently "focused" (shown in full) in each split stack -
-  // UI-only (like tourSeen or ledgerFilters), keyed by splitGroupId, not
-  // persisted or synced. Defaults to the first leg in CREATION order.
-  // Order never reshuffles - only which leg is focused changes, by
-  // clicking directly on any other leg's own peeking card (never the
-  // focused card itself, which isn't a stacking control).
-  var splitStackFocus = {};
-  var SPLIT_STACK_PEEK = 12;
-  var SPLIT_STACK_UNDERLAP = 18;
-  var SPLIT_STACK_MIN_FOCUS_WIDTH = 170;
-
-  var SPLIT_MASTER_ID = "__master__";
+  // Whether each split stack is expanded (showing every leg in full) or
+  // collapsed (just the master card + a peeking cue) - UI-only (like
+  // tourSeen or ledgerFilters), keyed by splitGroupId, not persisted or
+  // synced. Defaults to collapsed.
+  var splitStackExpanded = {};
+  var SPLIT_STACK_MAX_PEEKS = 3;
 
   // The overview card for a split - total amount, one chip per leg (its
   // bucket/account + its own amount, same chip styling income's split
@@ -2273,43 +2269,35 @@
     );
   }
 
-  // Shared by both split-group and transfer-distribution stacks: a virtual
-  // sequence [master, leg0, leg1, ...] where the master overview sits at
-  // position 0, always the leftmost thing in the stack, reached exactly
-  // like any other leg (clicking its way back into view through the same
-  // peeking edges, no special-cased "back" control). masterHtml is
-  // whatever the caller wants shown when the master position is focused;
-  // legs are rendered through the normal renderLedgerItem with a "i/N"
-  // badge, exactly like any other ledger card.
+  // Shared by both split-group and transfer-distribution stacks. Collapsed
+  // (the default): the master overview on top, plus up to
+  // SPLIT_STACK_MAX_PEEKS plain slivers cascading below it purely as a
+  // "there's more" cue - the whole sliver group is one click target that
+  // expands the stack. Expanded: every leg renders as its own normal,
+  // full-size ledger card (through renderLedgerItem with an "i/N" badge,
+  // exactly like any other ledger card) underneath the master, followed by
+  // a plain collapse control. masterHtml is whatever the caller wants
+  // shown as the permanent, never-clickable top card.
   function renderStackedLedgerGroup(groupId, masterHtml, legs) {
     var n = legs.length;
-    var focusVal = splitStackFocus[groupId];
-    var isMaster = !focusVal || focusVal === SPLIT_MASTER_ID;
-    var legIndex = isMaster ? -1 : legs.findIndex(function (r) { return r.id === focusVal; });
-    if (legIndex < 0) { isMaster = true; legIndex = -1; }
-    var focusVirtualIndex = isMaster ? 0 : legIndex + 1;
+    var expanded = !!splitStackExpanded[groupId];
+    var topHtml = '<div class="split-stack-top">' + masterHtml + '</div>';
 
-    // Every OTHER position gets its own plain stacked edge (no amount
-    // preview - just the visual cue that there's a card there) cascading
-    // further out the more positions sit between it and focus.
-    // data-distance (1 = right next to focus) is what sizeSplitStacks
-    // uses to place and z-order them. Still clickable - jumps focus
-    // straight to that position (a leg, or back to the master overview).
-    function edgeHtml(virtualIndex, side, distance) {
-      var txId = virtualIndex === 0 ? SPLIT_MASTER_ID : legs[virtualIndex - 1].id;
-      return '<div class="split-stack-rest split-stack-rest-' + side + '" data-tx-id="' + txId + '" data-split-group="' + groupId + '" data-distance="' + distance + '"></div>';
+    if (!expanded) {
+      var peekCount = Math.min(n, SPLIT_STACK_MAX_PEEKS);
+      var peeksHtml = "";
+      for (var i = 0; i < peekCount; i++) peeksHtml += '<div class="split-stack-peek"></div>';
+      return '<div class="split-card-stack" data-split-group="' + groupId + '">' +
+        topHtml +
+        '<div class="split-stack-peek-group" data-action="expand-stack" data-split-group="' + groupId + '">' + peeksHtml + '</div>' +
+      '</div>';
     }
 
-    var beforeHtml = "";
-    for (var b = 0; b < focusVirtualIndex; b++) beforeHtml += edgeHtml(b, "before", focusVirtualIndex - b);
-    var afterHtml = "";
-    for (var a = focusVirtualIndex + 1; a <= n; a++) afterHtml += edgeHtml(a, "after", a - focusVirtualIndex);
-
-    var focusedContent = isMaster ? masterHtml : renderLedgerItem(legs[legIndex], (legIndex + 1) + "/" + n);
-    var focusedHtml = '<div class="split-stack-focus">' + focusedContent + '</div>';
-
+    var legsHtml = legs.map(function (r, idx) { return renderLedgerItem(r, (idx + 1) + "/" + n); }).join("");
     return '<div class="split-card-stack" data-split-group="' + groupId + '">' +
-      beforeHtml + focusedHtml + afterHtml +
+      topHtml +
+      '<div class="split-stack-legs">' + legsHtml + '</div>' +
+      '<div class="split-stack-collapse" data-action="collapse-stack" data-split-group="' + groupId + '">▴ Show less</div>' +
     '</div>';
   }
 
@@ -2418,64 +2406,18 @@
     return renderStackedLedgerGroup(transfer.id, renderTransferMasterCard(transfer, stable), stable);
   }
 
-  // Sizes every split stack in wrap against its REAL current width - split
-  // out from wireSplitStacks (which also attaches click listeners, only
-  // needed once per render) so the window resize handler below can just
-  // re-measure on rotate/resize without piling up duplicate listeners.
-  //
-  // Before-cards are all right-anchored at the focused card's left edge
-  // (tucked under it by UNDERLAP); after-cards are all left-anchored at
-  // its right edge. Within each side, width grows with distance from
-  // focus while z-index shrinks - so the card closest to focus (distance
-  // 1, highest z on its side) sits on top and only its own peek width is
-  // exposed, while a further card's EXTRA width beyond that is what peeks
-  // out past it. Same mechanism as the old single-edge cascade, just
-  // mirrored on both sides and never collapsed into one combined card.
-  function sizeSplitStacks(wrap) {
-    Array.prototype.forEach.call(wrap.querySelectorAll(".split-card-stack"), function (stack) {
-      var containerWidth = stack.clientWidth || SPLIT_STACK_MIN_FOCUS_WIDTH;
-      var focus = stack.querySelector(".split-stack-focus");
-      var befores = Array.prototype.slice.call(stack.querySelectorAll(".split-stack-rest-before"));
-      var afters = Array.prototype.slice.call(stack.querySelectorAll(".split-stack-rest-after"));
-      var m = befores.length, k = afters.length;
-
-      var maxSidePeek = Math.max(0, (containerWidth - SPLIT_STACK_MIN_FOCUS_WIDTH) / 2);
-      var leftPeekPerCard = m > 0 ? Math.min(SPLIT_STACK_PEEK, maxSidePeek / m) : 0;
-      var rightPeekPerCard = k > 0 ? Math.min(SPLIT_STACK_PEEK, maxSidePeek / k) : 0;
-      var focusW = containerWidth - leftPeekPerCard * m - rightPeekPerCard * k;
-      var focusLeft = leftPeekPerCard * m;
-
-      if (focus) { focus.style.left = focusLeft + "px"; focus.style.width = focusW + "px"; }
-      var h = focus ? focus.offsetHeight : 0;
-      stack.style.height = h + "px";
-
-      var beforeRightEdge = focusLeft + SPLIT_STACK_UNDERLAP;
-      befores.forEach(function (card) {
-        var d = parseInt(card.getAttribute("data-distance"), 10);
-        var width = leftPeekPerCard * d + SPLIT_STACK_UNDERLAP;
-        card.style.height = h + "px";
-        card.style.width = width + "px";
-        card.style.left = (beforeRightEdge - width) + "px";
-        card.style.zIndex = String(m - d + 1);
-      });
-      var afterLeftEdge = focusLeft + focusW - SPLIT_STACK_UNDERLAP;
-      afters.forEach(function (card) {
-        var d = parseInt(card.getAttribute("data-distance"), 10);
-        var width = rightPeekPerCard * d + SPLIT_STACK_UNDERLAP;
-        card.style.height = h + "px";
-        card.style.width = width + "px";
-        card.style.left = afterLeftEdge + "px";
-        card.style.zIndex = String(k - d + 1);
+  // Plain flow layout now (no absolute positioning), so there's nothing to
+  // measure or re-measure on resize - just wire the expand/collapse clicks.
+  function wireSplitStacks(wrap) {
+    Array.prototype.forEach.call(wrap.querySelectorAll('[data-action="expand-stack"]'), function (el) {
+      el.addEventListener("click", function () {
+        splitStackExpanded[el.getAttribute("data-split-group")] = true;
+        renderLedgerList();
       });
     });
-  }
-
-  function wireSplitStacks(wrap) {
-    sizeSplitStacks(wrap);
-    Array.prototype.forEach.call(wrap.querySelectorAll(".split-stack-rest"), function (el) {
+    Array.prototype.forEach.call(wrap.querySelectorAll('[data-action="collapse-stack"]'), function (el) {
       el.addEventListener("click", function () {
-        var groupId = el.getAttribute("data-split-group");
-        splitStackFocus[groupId] = el.getAttribute("data-tx-id");
+        splitStackExpanded[el.getAttribute("data-split-group")] = false;
         renderLedgerList();
       });
     });
@@ -4681,8 +4623,6 @@
   window.addEventListener("resize", function () {
     updateTopbarHeightVar();
     updateArrowDockVar(manuallyFrozen);
-    var ledgerWrap = document.getElementById("ledgerListWrap");
-    if (ledgerWrap) sizeSplitStacks(ledgerWrap);
   });
 
   // Accounts + Buckets stay unfrozen (normal scroll) by default - no
