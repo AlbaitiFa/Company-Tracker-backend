@@ -935,9 +935,12 @@
     // buckets involved (see below).
     var txCascade = {};
 
-    function drawFromBucket(bucketId, amount) {
+    // emergency: skip bucketId's own balance entirely and cascade the FULL
+    // amount across the other buckets, instead of only cascading a shortfall
+    // after taking what bucketId can cover.
+    function drawFromBucket(bucketId, amount, emergency) {
       if (!bucketConfirmed.hasOwnProperty(bucketId)) return null;
-      var ownAvail = Math.max(bucketConfirmed[bucketId], 0);
+      var ownAvail = emergency ? 0 : Math.max(bucketConfirmed[bucketId], 0);
       var take = Math.min(ownAvail, amount);
       bucketConfirmed[bucketId] = round2(bucketConfirmed[bucketId] - take);
       var remaining = round2(amount - take);
@@ -956,12 +959,14 @@
         }
       });
       // if remaining > 0.004 here, every bucket is already at 0 — genuinely no money left anywhere
-      return { shortfall: shortfall, coveredBy: coveredBy, stillShort: remaining };
+      return { shortfall: shortfall, coveredBy: coveredBy, stillShort: remaining, emergency: !!emergency };
     }
 
     function floorNoteText(bucketId, result) {
       var b = bucketById(bucketId);
-      var txt = "Exceeded " + (b ? esc(b.name) : "this bucket") + "'s balance by " + fmt(result.shortfall) + ".";
+      var txt = result.emergency
+        ? "Emergency draw — " + (b ? esc(b.name) : "this bucket") + "'s own balance wasn't touched."
+        : "Exceeded " + (b ? esc(b.name) : "this bucket") + "'s balance by " + fmt(result.shortfall) + ".";
       if (result.coveredBy.length) {
         txt += " Covered by " + result.coveredBy.map(function (c) {
           var cb = bucketById(c.id);
@@ -983,7 +988,7 @@
       } else if (tx.type === "expense") {
         if (tx.affectsAccount && !tx.historical && accountBalances.hasOwnProperty(tx.accountId)) accountBalances[tx.accountId] -= tx.amount;
         if (tx.affectsBucket && bucketConfirmed.hasOwnProperty(tx.bucketId)) {
-          var r1 = drawFromBucket(tx.bucketId, tx.amount);
+          var r1 = drawFromBucket(tx.bucketId, tx.amount, tx.emergencyDraw);
           if (r1) {
             txFloorNotes[tx.id] = floorNoteText(tx.bucketId, r1);
             txCascade[tx.id] = { bucketId: tx.bucketId, shortfall: r1.shortfall, coveredBy: r1.coveredBy };
@@ -994,7 +999,7 @@
         if (!tx.historical && accountBalances.hasOwnProperty(tx.toAccountId)) accountBalances[tx.toAccountId] += tx.amount;
       } else if (tx.type === "payout") {
         if (bucketConfirmed.hasOwnProperty(tx.bucketId)) {
-          var r2 = drawFromBucket(tx.bucketId, tx.amount);
+          var r2 = drawFromBucket(tx.bucketId, tx.amount, tx.emergencyDraw);
           if (r2) {
             txFloorNotes[tx.id] = floorNoteText(tx.bucketId, r2);
             txCascade[tx.id] = { bucketId: tx.bucketId, shortfall: r2.shortfall, coveredBy: r2.coveredBy };
@@ -2907,10 +2912,12 @@
      is exactly the "distribute whenever" flow this exists for. */
   var distributingTransferId = null;
   var distributeType = "payout";
+  var distributeEmergency = false;
 
   function openDistributeTransferSheet(transferId) {
     distributingTransferId = transferId;
     distributeType = "payout";
+    distributeEmergency = false;
     document.getElementById("distributeTransferOverlay").classList.add("open");
     renderDistributeTransferSheet();
   }
@@ -2966,6 +2973,7 @@
         '<div class="field"><label>Bucket</label><select class="select" id="distributeBucket">' + bucketOptions(null) + '</select></div>' +
         '<div class="bucket-caption" style="margin:-9px 0 13px">From account: <strong>' + (toA ? esc(toA.name) : "—") + '</strong> (auto, where the transfer landed)</div>' +
         '<div class="field"><label>Amount</label><input class="input" type="number" step="0.01" min="0" id="distributeAmount" value="' + afloat + '"></div>' +
+        '<label class="check-row"><input type="checkbox" id="distributeEmergency"' + (distributeEmergency ? " checked" : "") + '> Emergency draw</label><div class="check-note">Leave this bucket\'s own balance untouched — pull the whole amount from the other buckets instead, in the usual floor order.</div>' +
         (distributeType === "payout"
           ? '<div class="field"><label>Goes to</label><select class="select" id="distributeDestination">' + payoutDestinationOptions("") + '</select></div>'
           : "") +
@@ -2985,6 +2993,8 @@
     });
     var addBtn = sheet.querySelector("#distributeAdd");
     if (addBtn) addBtn.addEventListener("click", handleDistributeTransferSubmit);
+    var emergencyToggle = sheet.querySelector("#distributeEmergency");
+    if (emergencyToggle) emergencyToggle.addEventListener("change", function () { distributeEmergency = emergencyToggle.checked; });
   }
 
   function handleDistributeTransferSubmit() {
@@ -3007,6 +3017,7 @@
       notes: notes, amount: amount, bucketId: bucketId,
       transferId: transfer.id, createdAt: now, updatedAt: now
     };
+    if (distributeEmergency) tx.emergencyDraw = true;
     // The distributed cash is sitting in the transfer's destination account,
     // so that's always where a distribution draws from.
     if (isPayout) {
