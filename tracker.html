@@ -2375,10 +2375,20 @@
     var note = (fromA ? esc(fromA.name) : "?") + " → " + (toA ? esc(toA.name) : "?");
     // A payout distribution can carry its own destination account (see the
     // Distribute sheet's "Goes to" field) - that's a real further transfer
-    // of the money, so it belongs on the master card next to the original one.
-    var extraRoutes = distributions.filter(function (tx) { return tx.type === "payout" && tx.toAccountId; }).map(function (tx) {
-      var srcAcct = accountById(tx.fromAccountId || transfer.toAccountId), destAcct = accountById(tx.toAccountId);
-      return '<div class="ledger-note">' + (srcAcct ? esc(srcAcct.name) : "?") + " → " + (destAcct ? esc(destAcct.name) : "?") + " · " + fmt(tx.amount) + '</div>';
+    // of the money, so it belongs on the master card next to the original
+    // one. Same as the bucket chips above, more than one distribution
+    // landing in the same account collapses into a single summed line.
+    var routeTotals = {}, routeOrder = [];
+    distributions.forEach(function (tx) {
+      if (tx.type !== "payout" || !tx.toAccountId) return;
+      var key = (tx.fromAccountId || transfer.toAccountId) + "|" + tx.toAccountId;
+      if (!routeTotals.hasOwnProperty(key)) { routeTotals[key] = { from: tx.fromAccountId || transfer.toAccountId, to: tx.toAccountId, amount: 0 }; routeOrder.push(key); }
+      routeTotals[key].amount += Number(tx.amount) || 0;
+    });
+    var extraRoutes = routeOrder.map(function (key) {
+      var r = routeTotals[key];
+      var srcAcct = accountById(r.from), destAcct = accountById(r.to);
+      return '<div class="ledger-note">' + (srcAcct ? esc(srcAcct.name) : "?") + " → " + (destAcct ? esc(destAcct.name) : "?") + " · " + fmt(round2(r.amount)) + '</div>';
     }).join("");
     var afloatHtml = afloat > 0.004
       ? '<div class="ledger-note split-afloat-note">' + fmt(afloat) + ' not yet distributed</div>'
