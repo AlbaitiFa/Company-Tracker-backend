@@ -4770,13 +4770,6 @@
     if (document.getElementById("distributeTransferOverlay").classList.contains("open")) closeDistributeTransferSheet();
     if (document.getElementById("confirmOverlay").classList.contains("open")) document.getElementById("confirmOverlay").classList.remove("open");
   });
-  window.addEventListener("beforeunload", function (e) {
-    if (!hasUnexportedChanges()) return;
-    e.preventDefault();
-    e.returnValue = "";
-    return "";
-  });
-
   /* ---------------- guided tours ---------------- */
   // Whether a given tour has been seen lives outside `state` on purpose -
   // it's a per-browser UI preference, not app data, so it must never sync
