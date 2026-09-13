@@ -2332,20 +2332,50 @@
     var distributed = (distributions || transferDistributions(transfer.id)).reduce(function (s, t) { return s + (Number(t.amount) || 0); }, 0);
     return round2((Number(transfer.amount) || 0) - distributed);
   }
+  // A transfer only moves money "within the company" when both ends are
+  // company-type accounts - crossing into/out of a personal, vendor, or
+  // employee account is a real inflow/outflow for the company, so the
+  // ledger should show it signed like an expense/income, not neutral.
+  function transferAccountEffect(tx) {
+    var fromA = accountById(tx.accountId), toA = accountById(tx.toAccountId);
+    var fromCompany = !!(fromA && fromA.type === "company");
+    var toCompany = !!(toA && toA.type === "company");
+    if (fromCompany && !toCompany) return "out";
+    if (!fromCompany && toCompany) return "in";
+    return "neutral";
+  }
 
   function renderTransferMasterCard(transfer, distributions) {
     var total = round2(Number(transfer.amount) || 0);
     var afloat = transferAfloat(transfer, distributions);
     var fromA = accountById(transfer.accountId), toA = accountById(transfer.toAccountId);
+    var tEffect = transferAccountEffect(transfer);
+    var amtClass = tEffect === "out" ? "neg" : (tEffect === "in" ? "pos" : "");
+    var amtSign = tEffect === "out" ? "−" : (tEffect === "in" ? "+" : "");
 
-    var chips = distributions.length ? '<div class="chip-row">' + distributions.map(function (tx) {
-      var b = bucketById(tx.bucketId);
-      var hue = b ? bucketColor(bucketIndex(tx.bucketId)) : null;
+    // Same bucket hit by more than one distribution (e.g. two Opex payouts
+    // off the same transfer) collapses into a single chip with the summed
+    // amount, rather than showing one chip per distribution.
+    var bucketTotals = {}, bucketOrder = [];
+    distributions.forEach(function (tx) {
+      if (!bucketTotals.hasOwnProperty(tx.bucketId)) { bucketTotals[tx.bucketId] = 0; bucketOrder.push(tx.bucketId); }
+      bucketTotals[tx.bucketId] += Number(tx.amount) || 0;
+    });
+    var chips = bucketOrder.length ? '<div class="chip-row">' + bucketOrder.map(function (bid) {
+      var b = bucketById(bid);
+      var hue = b ? bucketColor(bucketIndex(bid)) : null;
       var style = hue ? ' style="--chip-soft:var(--' + hue + '-soft);--chip-color:var(--' + hue + ')"' : "";
-      return '<span class="chip"' + style + '>' + esc(b ? b.name : "?") + ' ' + fmt(tx.amount) + '</span>';
+      return '<span class="chip"' + style + '>' + esc(b ? b.name : "?") + ' ' + fmt(round2(bucketTotals[bid])) + '</span>';
     }).join("") + '</div>' : "";
 
     var note = (fromA ? esc(fromA.name) : "?") + " → " + (toA ? esc(toA.name) : "?");
+    // A payout distribution can carry its own destination account (see the
+    // Distribute sheet's "Goes to" field) - that's a real further transfer
+    // of the money, so it belongs on the master card next to the original one.
+    var extraRoutes = distributions.filter(function (tx) { return tx.type === "payout" && tx.toAccountId; }).map(function (tx) {
+      var srcAcct = accountById(tx.fromAccountId || transfer.toAccountId), destAcct = accountById(tx.toAccountId);
+      return '<div class="ledger-note">' + (srcAcct ? esc(srcAcct.name) : "?") + " → " + (destAcct ? esc(destAcct.name) : "?") + " · " + fmt(tx.amount) + '</div>';
+    }).join("");
     var afloatHtml = afloat > 0.004
       ? '<div class="ledger-note split-afloat-note">' + fmt(afloat) + ' not yet distributed</div>'
       : "";
@@ -2358,10 +2388,11 @@
       '<div class="ledger-item">' +
         '<div class="ledger-top">' +
           '<div><div class="ledger-desc">' + esc(transfer.description || "(no description)") + '</div><div class="ledger-date">' + esc(transfer.date) + '</div></div>' +
-          '<div class="ledger-amt num">' + curr() + ' ' + fmt(total) + '</div>' +
+          '<div class="ledger-amt num ' + amtClass + '">' + curr() + ' ' + amtSign + fmt(total) + '</div>' +
         '</div>' +
         chips +
         '<div class="ledger-note">' + note + '</div>' +
+        extraRoutes +
         afloatHtml +
         '<div class="ledger-actions">' + actions + '</div>' +
       '</div>'
@@ -2476,7 +2507,10 @@
   }
 
   function renderLedgerItem(tx, splitBadge) {
-    var isOut = tx.type === "expense" || tx.type === "payout";
+    // A distribution is bucket categorization of money already moved by its
+    // parent transfer, not a new event against the company's cash position,
+    // so it always renders neutral regardless of payout/expense type.
+    var isOut = (tx.type === "expense" || tx.type === "payout") && !tx.transferId;
     var isIn = tx.type === "income" || tx.type === "opening_balance";
     var amtClass = isIn ? "pos" : (isOut ? "neg" : "");
     var amtSign = isIn ? "+" : (isOut ? "−" : "");
@@ -2515,6 +2549,9 @@
     } else if (tx.type === "transfer") {
       var fromA = accountById(tx.accountId), toA = accountById(tx.toAccountId);
       note = (fromA ? esc(fromA.name) : "?") + " → " + (toA ? esc(toA.name) : "?");
+      var tEffect = transferAccountEffect(tx);
+      if (tEffect === "out") { amtClass = "neg"; amtSign = "−"; }
+      else if (tEffect === "in") { amtClass = "pos"; amtSign = "+"; }
       var tAfloat = transferAfloat(tx);
       if (tAfloat > 0.004) afloatNote = fmt(tAfloat) + " not yet distributed";
     } else if (tx.type === "payout") {
@@ -2928,7 +2965,11 @@
           '<button type="button" data-distribute-type="expense" class="' + (distributeType === "expense" ? "active" : "") + '">Expense</button>' +
         '</div>' +
         '<div class="field"><label>Bucket</label><select class="select" id="distributeBucket">' + bucketOptions(null) + '</select></div>' +
+        '<div class="bucket-caption" style="margin:-9px 0 13px">From account: <strong>' + (toA ? esc(toA.name) : "—") + '</strong> (auto, where the transfer landed)</div>' +
         '<div class="field"><label>Amount</label><input class="input" type="number" step="0.01" min="0" id="distributeAmount" value="' + afloat + '"></div>' +
+        (distributeType === "payout"
+          ? '<div class="field"><label>Goes to</label><select class="select" id="distributeDestination">' + payoutDestinationOptions("") + '</select></div>'
+          : "") +
         '<div class="field"><label>Description (optional)</label><input class="input" type="text" id="distributeDesc" placeholder="' + esc(transfer.description || "") + '"></div>' +
         '<div class="field"><label>Notes (optional)</label><textarea class="input" id="distributeNotes"></textarea></div>' +
         '<button type="button" class="btn btn-primary" id="distributeAdd">Add distribution</button>'
@@ -2967,7 +3008,18 @@
       notes: notes, amount: amount, bucketId: bucketId,
       transferId: transfer.id, createdAt: now, updatedAt: now
     };
-    if (!isPayout) { tx.affectsBucket = true; tx.affectsAccount = false; }
+    // The distributed cash is sitting in the transfer's destination account,
+    // so that's always where a distribution draws from.
+    if (isPayout) {
+      tx.fromAccountId = transfer.toAccountId;
+      var destEl = sheet.querySelector("#distributeDestination");
+      var destRaw = destEl ? destEl.value : "";
+      tx.toAccountId = destRaw.indexOf("account:") === 0 ? destRaw.slice(8) : null;
+    } else {
+      tx.accountId = transfer.toAccountId;
+      tx.affectsBucket = true;
+      tx.affectsAccount = true;
+    }
     state.transactions.push(tx);
     persist();
     renderDistributeTransferSheet();
